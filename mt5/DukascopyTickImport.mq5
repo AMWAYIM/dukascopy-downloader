@@ -39,7 +39,7 @@ int OpenJobReadDual(const string path, const int typeFlags)
    return FileOpen(path, FILE_READ | typeFlags | FILE_SHARE_READ);
   }
 
-bool WriteJobTextDual(const string path, const string text)
+bool WriteJobTextDual(const string path, const string text, const bool quiet = false)
   {
    bool ok = false;
    int hc = FileOpen(path, FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON
@@ -58,7 +58,7 @@ bool WriteJobTextDual(const string path, const string text)
       FileClose(hl);
       ok = true;
      }
-   if(!ok)
+   if(!ok && !quiet)
       Print("WriteJobTextDual FileOpen failed: ", GetLastError(), ": ", path);
    return ok;
   }
@@ -143,18 +143,25 @@ bool WriteProgressThrottled(const string state, const string phase, const long t
                             const string message, const int errorCode, const bool force,
                             const int filesDone = -1, const int filesTotal = -1)
   {
-   if(!force && phase == "import_ticks")
+   // Terminal states must never be throttled: the controller waits for an
+   // explicit ticks_done/done/error marker, so dropping it here leaves the
+   // import stuck on the previous progress line (e.g. hanging at 89%).
+   bool terminal = (state == "ticks_done" || state == "done" || state == "error");
+   if(!force && !terminal && phase == "import_ticks")
      {
       ulong now = GetTickCount64();
       if(now - g_lastProgressMs < (ulong)PROGRESS_MIN_MS)
          return true;
       g_lastProgressMs = now;
      }
+   if(terminal || force)
+      g_lastProgressMs = GetTickCount64();
    string path = JobDir() + "progress.txt";
    // The Python controller polls this file while the script runs. Permit
    // concurrent readers/writers so the final ticks_done marker is not lost
    // to a transient sharing violation. Written to both Common and local
-   // Files so portable and roaming controllers both see it.
+   // Files so portable and roaming controllers both see it. Terminal
+   // markers retry briefly so they are never lost to a transient lock.
    string filesLine = "";
    if(filesDone >= 0)
       filesLine += "files_done=" + IntegerToString(filesDone) + "\n";
@@ -171,7 +178,19 @@ bool WriteProgressThrottled(const string state, const string phase, const long t
                    + "error_code=" + IntegerToString(errorCode) + "\n"
                    + filesLine
                    + "script_version=1.21\n";
-   return WriteJobTextDual(path, content);
+   for(int attempt = 0; attempt < 20; attempt++)
+     {
+      // Quiet while terminal retries are pending: a persistently locked
+      // file would otherwise spam the Experts log 20 times. Single-shot
+      // non-terminal writes stay loud via the default quiet=false.
+      if(WriteJobTextDual(path, content, terminal))
+         return true;
+      if(!terminal)
+         return false;
+      Sleep(250);
+     }
+   Print("WriteProgress failed after retries: ", path);
+   return false;
   }
 
 //+------------------------------------------------------------------+
@@ -575,10 +594,6 @@ bool ImportTicksFromHourFiles(const string customSymbol, const string hoursPath,
       if(!FlushDayTicks(customSymbol, dayTicks, dayCount, ticksImported, ticksTotal))
          return false;
      }
-
-   if(fileTotal > 0)
-      WriteProgress("running", "import_ticks", ticksImported, ticksTotal, 89, customSymbol,
-                    "Finalizing import…", 0, fileTotal, fileTotal);
 
    return true;
   }

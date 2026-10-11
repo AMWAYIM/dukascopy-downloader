@@ -8,7 +8,11 @@ from unittest import mock
 
 import export.mt5_importer as mt5_importer
 from export.mt5_importer import (
+    EXPECTED_SCRIPT_VERSION,
+    MT5_BUNDLE_DIR,
+    SCRIPT_MQ5_NAME,
     Mt5Settings,
+    _import_progress_payload,
     build_mt5_launch_args,
     candidate_job_dirs,
     diagnose_mt5,
@@ -243,6 +247,52 @@ class Mt5ValidateConfigTests(unittest.TestCase):
             diag = diagnose_mt5({"terminal_exe": str(exe), "portable": True})
             for key in ("ok", "mode", "terminal_exe", "launch_args", "job_base", "warnings"):
                 self.assertIn(key, diag)
+
+
+class Mt5ProgressPayloadTests(unittest.TestCase):
+    def _base_progress(self) -> dict:
+        return {
+            "message": "Hour file 3 / 10",
+            "percent": 34,
+            "phase": "import_ticks",
+            "ticks_imported": 300,
+            "ticks_total": 1000,
+            "custom_symbol": "EURUSD.DUK",
+            "files_done": 3,
+            "files_total": 10,
+        }
+
+    def test_payload_passes_through_without_script_version(self) -> None:
+        payload = _import_progress_payload(self._base_progress(), "EURUSD.DUK")
+        self.assertNotIn("script_version", payload)
+        self.assertEqual(payload["message"], "Hour file 3 / 10")
+        self.assertEqual(payload["files_done"], 3)
+        self.assertEqual(payload["files_total"], 10)
+
+    def test_payload_passes_through_current_script_version(self) -> None:
+        progress = self._base_progress()
+        progress["script_version"] = EXPECTED_SCRIPT_VERSION
+        payload = _import_progress_payload(progress, "EURUSD.DUK")
+        self.assertEqual(payload["script_version"], EXPECTED_SCRIPT_VERSION)
+        self.assertEqual(payload["message"], "Hour file 3 / 10")
+
+    def test_payload_warns_on_stale_script_version(self) -> None:
+        progress = self._base_progress()
+        progress["script_version"] = "0.0"
+        payload = _import_progress_payload(progress, "EURUSD.DUK")
+        self.assertEqual(payload["script_version"], "0.0")
+        self.assertIn("stale", payload["message"])
+        self.assertIn("recompile", payload["message"])
+        self.assertTrue(payload["message"].endswith("Hour file 3 / 10"))
+
+    def test_bundled_mq5_stamp_matches_expected_version(self) -> None:
+        import re
+
+        src = (MT5_BUNDLE_DIR / SCRIPT_MQ5_NAME).read_text(encoding="utf-8")
+        match = re.search(r'\+ "script_version=([^"\\]+)\\n"', src)
+        self.assertIsNotNone(match, "script_version stamp missing from bundled MQ5")
+        assert match is not None
+        self.assertEqual(match.group(1), EXPECTED_SCRIPT_VERSION)
 
 
 class Mt5CliTests(unittest.TestCase):

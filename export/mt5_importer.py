@@ -39,6 +39,7 @@ LEGACY_MANAGER_NAMES = (
     "DukascopySymbolManager.ex5",
 )
 JOB_ROOT = "dukascopy_jobs"
+EXPECTED_SCRIPT_VERSION = "1.21"
 
 _import_lock = threading.Lock()
 _active_terminal: dict[str, Path] = {}
@@ -857,6 +858,14 @@ def _import_progress_payload(
     if files_total > 0:
         payload["files_done"] = files_done
         payload["files_total"] = files_total
+    script_version = str(progress.get("script_version", ""))
+    if script_version:
+        payload["script_version"] = script_version
+        if script_version != EXPECTED_SCRIPT_VERSION:
+            payload["message"] = (
+                f"MT5 script v{script_version} is stale (expected v{EXPECTED_SCRIPT_VERSION}) — "
+                "recompile DukascopyTickImport.mq5 in MetaEditor. " + payload["message"]
+            )
     return payload
 
 
