@@ -4,7 +4,7 @@
 //| Launched via [StartUp] Script= in import.ini (live terminal).     |
 //+------------------------------------------------------------------+
 #property copyright "Dukascopy Downloader"
-#property version   "1.20"
+#property version   "1.21"
 #property strict
 #property script_show_inputs
 
@@ -25,25 +25,80 @@ string JobDir()
   }
 
 //+------------------------------------------------------------------+
+// Dual-location job files: Python stages per terminal mode (portable
+// MQL5\Files vs roaming Common\Files). Reads try Common first, then the
+// local Files folder; small outputs are written to both so the Python
+// controller finds them regardless of mode.
+int OpenJobReadDual(const string path, const int typeFlags)
+  {
+   ResetLastError();
+   int h = FileOpen(path, FILE_READ | typeFlags | FILE_COMMON | FILE_SHARE_READ);
+   if(h != INVALID_HANDLE)
+      return h;
+   ResetLastError();
+   return FileOpen(path, FILE_READ | typeFlags | FILE_SHARE_READ);
+  }
+
+bool WriteJobTextDual(const string path, const string text)
+  {
+   bool ok = false;
+   int hc = FileOpen(path, FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON
+                          | FILE_SHARE_READ | FILE_SHARE_WRITE);
+   if(hc != INVALID_HANDLE)
+     {
+      FileWriteString(hc, text);
+      FileClose(hc);
+      ok = true;
+     }
+   int hl = FileOpen(path, FILE_WRITE | FILE_TXT | FILE_ANSI
+                          | FILE_SHARE_READ | FILE_SHARE_WRITE);
+   if(hl != INVALID_HANDLE)
+     {
+      FileWriteString(hl, text);
+      FileClose(hl);
+      ok = true;
+     }
+   if(!ok)
+      Print("WriteJobTextDual FileOpen failed: ", GetLastError(), ": ", path);
+   return ok;
+  }
+
+bool AppendJobLogDual(const string path, const string line)
+  {
+   bool ok = false;
+   int hc = FileOpen(path, FILE_READ | FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
+   if(hc == INVALID_HANDLE)
+      hc = FileOpen(path, FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
+   else
+      FileSeek(hc, 0, SEEK_END);
+   if(hc != INVALID_HANDLE)
+     {
+      FileWriteString(hc, line);
+      FileClose(hc);
+      ok = true;
+     }
+   int hl = FileOpen(path, FILE_READ | FILE_WRITE | FILE_TXT | FILE_ANSI);
+   if(hl == INVALID_HANDLE)
+      hl = FileOpen(path, FILE_WRITE | FILE_TXT | FILE_ANSI);
+   else
+      FileSeek(hl, 0, SEEK_END);
+   if(hl != INVALID_HANDLE)
+     {
+      FileWriteString(hl, line);
+      FileClose(hl);
+      ok = true;
+     }
+   if(!ok)
+      Print("[dukascopy] JobLog open failed ", GetLastError(), ": ", line);
+   return ok;
+  }
+
+//+------------------------------------------------------------------+
 void JobLog(const string line)
   {
    string path = JobDir() + "job.log";
-   int h = FileOpen(path, FILE_READ | FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
-   if(h == INVALID_HANDLE)
-     {
-      h = FileOpen(path, FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
-      if(h == INVALID_HANDLE)
-        {
-         Print("[dukascopy] JobLog open failed ", GetLastError(), ": ", line);
-         return;
-        }
-     }
-   else
-      FileSeek(h, 0, SEEK_END);
-
    string stamp = TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS);
-   FileWriteString(h, stamp + " " + line + "\n");
-   FileClose(h);
+   AppendJobLogDual(path, stamp + " " + line + "\n");
    Print("[dukascopy] ", line);
   }
 
@@ -98,20 +153,14 @@ bool WriteProgressThrottled(const string state, const string phase, const long t
    string path = JobDir() + "progress.txt";
    // The Python controller polls this file while the script runs. Permit
    // concurrent readers/writers so the final ticks_done marker is not lost
-   // to a transient sharing violation.
-   int h = FileOpen(path, FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON
-                         | FILE_SHARE_READ | FILE_SHARE_WRITE);
-   if(h == INVALID_HANDLE)
-     {
-      Print("WriteProgress FileOpen failed: ", GetLastError());
-      return false;
-     }
+   // to a transient sharing violation. Written to both Common and local
+   // Files so portable and roaming controllers both see it.
    string filesLine = "";
    if(filesDone >= 0)
       filesLine += "files_done=" + IntegerToString(filesDone) + "\n";
    if(filesTotal >= 0)
       filesLine += "files_total=" + IntegerToString(filesTotal) + "\n";
-   FileWriteString(h,
+   string content =
                    "state=" + state + "\n"
                    + "phase=" + phase + "\n"
                    + "ticks_imported=" + IntegerToString(ticksImported) + "\n"
@@ -121,16 +170,15 @@ bool WriteProgressThrottled(const string state, const string phase, const long t
                    + "message=" + message + "\n"
                    + "error_code=" + IntegerToString(errorCode) + "\n"
                    + filesLine
-                   + "script_version=1.19\n");
-   FileClose(h);
-   return true;
+                   + "script_version=1.21\n";
+   return WriteJobTextDual(path, content);
   }
 
 //+------------------------------------------------------------------+
 string ManifestValue(const string key)
   {
    string path = JobDir() + "manifest.txt";
-   int h = FileOpen(path, FILE_READ | FILE_TXT | FILE_ANSI | FILE_COMMON);
+   int h = OpenJobReadDual(path, FILE_TXT | FILE_ANSI);
    if(h == INVALID_HANDLE)
       return "";
    string prefix = key + "=";
@@ -297,6 +345,11 @@ int OpenCommonRead(const string path, const int typeFlags)
       if(h != INVALID_HANDLE)
          return h;
       lastError = GetLastError();
+      ResetLastError();
+      h = FileOpen(path, FILE_READ | typeFlags | FILE_SHARE_READ);
+      if(h != INVALID_HANDLE)
+         return h;
+      lastError = GetLastError();
       if(attempt + 1 < attempts)
          Sleep(250);
      }
@@ -329,7 +382,7 @@ bool FlushDayTicks(const string customSymbol, MqlTick &ticks[], const int count,
 bool ImportTicksFromCsv(const string customSymbol, const string tickPath,
                         const long ticksTotal, long &ticksImported)
   {
-   int h = FileOpen(tickPath, FILE_READ | FILE_TXT | FILE_ANSI | FILE_COMMON);
+   int h = OpenCommonRead(tickPath, FILE_TXT | FILE_ANSI);
    if(h == INVALID_HANDLE)
      {
       Print("tick CSV open failed: ", GetLastError());
@@ -625,8 +678,9 @@ bool MatchesFilter(const string symbol, const string customPath, const string su
 bool ListCustomSymbols(const string customPath, const string suffix)
   {
    string outPath = JobDir() + "symbols.txt";
-   int out = FileOpen(outPath, FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
-   if(out == INVALID_HANDLE)
+   int outC = FileOpen(outPath, FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
+   int outL = FileOpen(outPath, FILE_WRITE | FILE_TXT | FILE_ANSI);
+   if(outC == INVALID_HANDLE && outL == INVALID_HANDLE)
      {
       WriteProgress("error", "list", 0, 0, 0, "", "Failed to open symbols.txt", GetLastError());
       return false;
@@ -646,13 +700,20 @@ bool ListCustomSymbols(const string customPath, const string suffix)
       if(ticks > 0)
          GetSymbolTickSpan(sym, firstMsc, lastMsc);
 
-      FileWriteString(out, sym + "|" + IntegerToString(ticks)
+      string outLine = sym + "|" + IntegerToString(ticks)
                       + "|" + IntegerToString(firstMsc)
-                      + "|" + IntegerToString(lastMsc) + "\n");
+                      + "|" + IntegerToString(lastMsc) + "\n";
+      if(outC != INVALID_HANDLE)
+         FileWriteString(outC, outLine);
+      if(outL != INVALID_HANDLE)
+         FileWriteString(outL, outLine);
       listed++;
      }
 
-   FileClose(out);
+   if(outC != INVALID_HANDLE)
+      FileClose(outC);
+   if(outL != INVALID_HANDLE)
+      FileClose(outL);
    WriteProgress("done", "list", 0, 0, 100, "",
                 "Listed " + IntegerToString(listed) + " custom symbol(s)");
    return true;
@@ -859,7 +920,7 @@ bool DeleteCustomSymbol(const string symbol)
 //+------------------------------------------------------------------+
 long CountCsvTicks(const string tickPath)
   {
-   int h = FileOpen(tickPath, FILE_READ | FILE_TXT | FILE_ANSI | FILE_COMMON);
+   int h = OpenCommonRead(tickPath, FILE_TXT | FILE_ANSI);
    if(h == INVALID_HANDLE)
       return 0;
 
@@ -891,7 +952,7 @@ void OnStart()
       return;
      }
 
-   JobLog("OnStart v1.20 JobId=" + JobId + " chart=" + _Symbol);
+   JobLog("OnStart v1.21 JobId=" + JobId + " chart=" + _Symbol);
 
    string action = ManifestValue("action");
    if(action == "list")

@@ -797,6 +797,7 @@ $("#ex-start-btn").addEventListener("click", async () => {
     }
   }
   try {
+    await flushMt5Save();
     const job = await api("/api/mt5/import", { method: "POST", body: JSON.stringify(body) });
     toastSuccess("MT5 import started");
     prependJob(job);
@@ -1306,6 +1307,8 @@ async function loadSettings() {
     if (suffix) suffix.value = mt5.custom_suffix || ".DUK";
     const origin = $("#set-mt5-origin");
     if (origin) origin.value = mt5.origin_symbol || "";
+    const portable = $("#set-mt5-portable");
+    if (portable) portable.checked = !!mt5.portable;
     state.automations = data.automations || [];
     renderAutomationsList();
   } catch (e) {
@@ -1320,6 +1323,7 @@ async function saveMt5Settings(patch) {
     if (mt5.data_path != null) $("#set-mt5-data").value = mt5.data_path;
     if (mt5.custom_suffix != null) $("#set-mt5-suffix").value = mt5.custom_suffix;
     if (mt5.origin_symbol != null) $("#set-mt5-origin").value = mt5.origin_symbol;
+    if (mt5.portable != null) $("#set-mt5-portable").checked = !!mt5.portable;
   } catch (e) {
     toastError(e.message);
   }
@@ -1350,9 +1354,18 @@ $("#set-default-workers")?.addEventListener("change", (e) => {
 });
 
 let mt5SaveTimer = null;
+let pendingMt5Patch = {};
 function queueMt5Save(patch) {
+  pendingMt5Patch = { ...pendingMt5Patch, ...patch };
   clearTimeout(mt5SaveTimer);
-  mt5SaveTimer = setTimeout(() => saveMt5Settings(patch), 400);
+  mt5SaveTimer = setTimeout(() => flushMt5Save(), 400);
+}
+async function flushMt5Save() {
+  clearTimeout(mt5SaveTimer);
+  mt5SaveTimer = null;
+  const patch = pendingMt5Patch;
+  pendingMt5Patch = {};
+  if (patch && Object.keys(patch).length) await saveMt5Settings(patch);
 }
 
 $("#set-mt5-terminal")?.addEventListener("input", (e) => {
@@ -1366,6 +1379,10 @@ $("#set-mt5-suffix")?.addEventListener("change", (e) => {
 });
 $("#set-mt5-origin")?.addEventListener("input", (e) => {
   queueMt5Save({ origin_symbol: e.target.value.trim() });
+});
+$("#set-mt5-portable")?.addEventListener("change", async (e) => {
+  await flushMt5Save();
+  saveMt5Settings({ portable: e.target.checked });
 });
 $("#dl-workers")?.addEventListener("input", () => {
   $("#dl-workers").dataset.userTouched = "1";

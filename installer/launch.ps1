@@ -157,6 +157,9 @@ function Invoke-LauncherDoctor([string] $PythonExe) {
   }
 
   $dataPath = [string]$mt5.data_path
+  $portable = $mt5.portable -eq $true -or "$($mt5.portable)".ToLower() -in @('1', 'true', 'yes', 'on', 'portable')
+  $mode = if ($portable) { 'portable (/portable)' } else { 'roaming (default)' }
+  Write-DoctorRow 'MT5 mode' $mode
   if ($dataPath -and (Test-Path -LiteralPath $dataPath)) {
     Write-DoctorRow 'MT5 data folder' $dataPath
     $eaPath = Join-Path $dataPath 'MQL5\Scripts\dukascopy\DukascopyTickImport.ex5'

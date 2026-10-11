@@ -213,13 +213,18 @@
       <div class="card">
         <h2>MetaTrader 5</h2>
         <div class="field">
-          <label for="set-mt5-terminal">terminal64.exe path</label>
-          <input type="text" id="set-mt5-terminal" placeholder="C:\Program Files\MetaTrader 5\terminal64.exe" spellcheck="false">
-          <p class="hint">Required for Import to MT5. Data folder is auto-detected unless overridden below.</p>
+          <label for="set-mt5-terminal">terminal64.exe path (optional)</label>
+          <input type="text" id="set-mt5-terminal" placeholder="Auto-detected when blank" spellcheck="false">
+          <p class="hint">Leave blank to auto-detect a running/installed terminal. Required for Import to MT5. Data folder is auto-detected unless overridden below.</p>
         </div>
         <div class="field">
           <label for="set-mt5-data">Data folder (optional)</label>
           <input type="text" id="set-mt5-data" placeholder="%APPDATA%\MetaQuotes\Terminal\&lt;instance&gt;" spellcheck="false">
+          <p class="hint" id="set-mt5-data-hint">Roaming: leave portable off. Portable: set to the terminal folder itself.</p>
+        </div>
+        <div class="field">
+          <label class="checkbox"><input type="checkbox" id="set-mt5-portable"> Portable terminal (launch with /portable)</label>
+          <p class="hint">Off by default (normal install, data in %APPDATA%). Turn on only when the data folder lives next to terminal64.exe.</p>
         </div>
         <div class="grid-2">
           <div class="field">

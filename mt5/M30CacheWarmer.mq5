@@ -16,6 +16,45 @@ input string InpJobId          = "";         // Optional: dukascopy_jobs progres
 
 #define JOB_ROOT "dukascopy_jobs\\"
 
+// Dual-location files: try Common first, then the local Files folder, so
+// both portable and roaming Python controllers interoperate.
+int OpenDualRead(const string path, const int typeFlags)
+  {
+   ResetLastError();
+   int h = FileOpen(path, FILE_READ | typeFlags | FILE_COMMON | FILE_SHARE_READ);
+   if(h != INVALID_HANDLE)
+      return h;
+   ResetLastError();
+   return FileOpen(path, FILE_READ | typeFlags | FILE_SHARE_READ);
+  }
+
+bool DualFileExists(const string path)
+  {
+   if(FileIsExist(path, FILE_COMMON))
+      return true;
+   return FileIsExist(path, 0);
+  }
+
+bool WriteTextDual(const string path, const string text)
+  {
+   bool ok = false;
+   int hc = FileOpen(path, FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
+   if(hc != INVALID_HANDLE)
+     {
+      FileWriteString(hc, text);
+      FileClose(hc);
+      ok = true;
+     }
+   int hl = FileOpen(path, FILE_WRITE | FILE_TXT | FILE_ANSI);
+   if(hl != INVALID_HANDLE)
+     {
+      FileWriteString(hl, text);
+      FileClose(hl);
+      ok = true;
+     }
+   return ok;
+  }
+
 static const int CACHE_FORMAT_VERSION = 1;
 
 //+------------------------------------------------------------------+
@@ -31,12 +70,8 @@ void WriteJobProgress(const string state, const string phase, const int percent,
    if(StringLen(InpJobId) < 8)
       return;
 
-   int h = FileOpen(JobProgressPath(), FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
-   if(h == INVALID_HANDLE)
-      return;
-
    // ticks_* are job-protocol stubs — this EA writes M30 bars, not ticks
-   FileWriteString(h,
+   WriteTextDual(JobProgressPath(),
                    "state=" + state + "\n"
                    + "phase=" + phase + "\n"
                    + "ticks_imported=0\n"
@@ -46,7 +81,6 @@ void WriteJobProgress(const string state, const string phase, const int percent,
                    + "message=" + message + "\n"
                    + "error_code=" + IntegerToString(errorCode) + "\n"
                    + "script_version=M30CacheWarmer-1.00\n");
-   FileClose(h);
   }
 
 //+------------------------------------------------------------------+
@@ -75,7 +109,7 @@ string BuildCacheFullPathHint()
 //+------------------------------------------------------------------+
 bool CacheFileExists()
   {
-   return FileIsExist(BuildCacheFileName(), FILE_COMMON);
+   return DualFileExists(BuildCacheFileName());
   }
 
 //+------------------------------------------------------------------+
@@ -120,27 +154,43 @@ bool ReadLengthPrefixedString(const int handle, string &text)
 bool WriteM30Cache(const MqlRates &rates[], const int count)
   {
    const string fileName = BuildCacheFileName();
-   const int handle = FileOpen(fileName, FILE_WRITE | FILE_BIN | FILE_COMMON);
-   if(handle == INVALID_HANDLE)
+   const int hc = FileOpen(fileName, FILE_WRITE | FILE_BIN | FILE_COMMON);
+   const int hl = FileOpen(fileName, FILE_WRITE | FILE_BIN);
+   if(hc == INVALID_HANDLE && hl == INVALID_HANDLE)
      {
       Print("M30 cache export failed | FileOpen err=", GetLastError(), " | path=", BuildCacheFullPathHint());
       return false;
      }
 
-   FileWriteInteger(handle, CACHE_FORMAT_VERSION);
-   if(!WriteLengthPrefixedString(handle, _Symbol))
+   bool ok = true;
+   int handles[2];
+   handles[0] = hc;
+   handles[1] = hl;
+   for(int k = 0; k < 2; k++)
      {
-      FileClose(handle);
-      return false;
+      int handle = handles[k];
+      if(handle == INVALID_HANDLE)
+         continue;
+      FileWriteInteger(handle, CACHE_FORMAT_VERSION);
+      if(!WriteLengthPrefixedString(handle, _Symbol))
+        {
+         ok = false;
+         break;
+        }
+      FileWriteInteger(handle, count);
+      if(FileWriteArray(handle, rates, 0, count) != (uint)count)
+        {
+         Print("M30 cache export failed | FileWriteArray err=", GetLastError());
+         ok = false;
+         break;
+        }
      }
-   FileWriteInteger(handle, count);
-   if(FileWriteArray(handle, rates, 0, count) != (uint)count)
-     {
-      FileClose(handle);
-      Print("M30 cache export failed | FileWriteArray err=", GetLastError());
+   if(hc != INVALID_HANDLE)
+      FileClose(hc);
+   if(hl != INVALID_HANDLE)
+      FileClose(hl);
+   if(!ok)
       return false;
-     }
-   FileClose(handle);
 
    Print("M30 cache exported | bars=", count,
          " | symbol=", _Symbol,
@@ -156,10 +206,10 @@ bool ReadM30Cache(MqlRates &rates[], int &count, string &symbol)
    ArrayResize(rates, 0);
 
    const string fileName = BuildCacheFileName();
-   if(!FileIsExist(fileName, FILE_COMMON))
+   if(!DualFileExists(fileName))
       return false;
 
-   const int handle = FileOpen(fileName, FILE_READ | FILE_BIN | FILE_COMMON);
+   const int handle = OpenDualRead(fileName, FILE_BIN);
    if(handle == INVALID_HANDLE)
      {
       Print("M30 cache import failed | FileOpen err=", GetLastError(), " | path=", BuildCacheFullPathHint());

@@ -11,6 +11,17 @@ from typing import Any
 
 from config.settings import Settings
 
+
+def _coerce_portable(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if value is None:
+        return False
+    return str(value).strip().lower() in ("1", "true", "yes", "on", "portable")
+
+
 DEFAULT_UI = {
     "theme": "light",
     "default_workers": 15,
@@ -21,6 +32,7 @@ DEFAULT_MT5 = {
     "data_path": "",
     "custom_suffix": ".DUK",
     "origin_symbol": "",
+    "portable": False,
 }
 
 DEFAULT_AUTOMATION_ACTION = {
@@ -56,6 +68,7 @@ class SettingsStore:
             if isinstance(raw.get("mt5"), dict):
                 mt5 = {**DEFAULT_MT5, **raw["mt5"]}
                 mt5.pop("shutdown_terminal", None)
+                mt5["portable"] = _coerce_portable(mt5.get("portable"))
                 self._data["mt5"] = mt5
             if isinstance(raw.get("automations"), list):
                 self._data["automations"] = raw["automations"]
@@ -85,6 +98,8 @@ class SettingsStore:
     def set_mt5(self, patch: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             patch = {k: v for k, v in patch.items() if k != "shutdown_terminal"}
+            if "portable" in patch:
+                patch["portable"] = _coerce_portable(patch["portable"])
             self._data["mt5"] = {**self._data["mt5"], **patch}
             self._data["mt5"].pop("shutdown_terminal", None)
             self._save()

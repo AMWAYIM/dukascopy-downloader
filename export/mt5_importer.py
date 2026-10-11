@@ -55,19 +55,44 @@ class Mt5Settings:
     terminal_exe: Path
     data_path: Path
     custom_suffix: str = ".DUK"
+    portable: bool = False
+
+    @classmethod
+    def validate_config(cls, raw: dict[str, Any]) -> None:
+        """Cheap config check without environment probing (no I/O auto-detect).
+
+        Only validates explicitly configured paths; blank terminal/data_path
+        is allowed and resolved later by :meth:`from_dict` at job runtime.
+        """
+        terminal = str(raw.get("terminal_exe") or "").strip()
+        if terminal and not Path(terminal).is_file():
+            raise ValueError(f"MetaTrader 5 not found: {Path(terminal)}")
+        data_path_raw = str(raw.get("data_path") or "").strip()
+        if data_path_raw and not Path(data_path_raw).is_dir():
+            raise ValueError(f"MT5 data folder not found: {Path(data_path_raw)}")
+        suffix = str(raw.get("custom_suffix") or ".DUK").strip() or ".DUK"
+        if not suffix.startswith("."):
+            suffix = "." + suffix
+        if len(suffix) > 30:
+            raise ValueError(f"Custom suffix '{suffix}' is too long")
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Mt5Settings:
         terminal = str(raw.get("terminal_exe") or "").strip()
-        if not terminal:
-            raise ValueError("MetaTrader 5 path is not configured — set it in Settings")
-        terminal_exe = Path(terminal)
-        if not terminal_exe.is_file():
-            raise ValueError(f"MetaTrader 5 not found: {terminal_exe}")
+        if terminal:
+            terminal_exe = Path(terminal)
+            if not terminal_exe.is_file():
+                raise ValueError(f"MetaTrader 5 not found: {terminal_exe}")
+        else:
+            terminal_exe, _source = resolve_mt5_terminal_exe()
+
+        portable = _parse_portable(raw.get("portable"))
 
         data_path_raw = str(raw.get("data_path") or "").strip()
         if data_path_raw:
             data_path = Path(data_path_raw)
+        elif portable:
+            data_path = terminal_exe.parent
         else:
             data_path = resolve_mt5_data_path(terminal_exe)
         if not data_path.is_dir():
@@ -80,7 +105,107 @@ class Mt5Settings:
             terminal_exe=terminal_exe,
             data_path=data_path,
             custom_suffix=suffix,
+            portable=portable,
         )
+
+
+def _parse_portable(value: Any) -> bool:
+    """Coerce the portable flag (default False = roaming)."""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    return text in ("1", "true", "yes", "on", "portable")
+
+
+MT5_DEFAULT_INSTALL_PATHS = (
+    Path(r"C:\Program Files\MetaTrader 5\terminal64.exe"),
+    Path(r"C:\Program Files (x86)\MetaTrader 5\terminal64.exe"),
+)
+
+
+def _read_origin_id(origin: Path) -> str:
+    """Read MT5's origin.txt (UTF-16LE as written by the terminal, or UTF-8)."""
+    raw = origin.read_bytes()
+    if raw[:2] == b"\xff\xfe":
+        return raw.decode("utf-16", errors="ignore").strip().lstrip("\ufeff").strip()
+    if b"\x00" in raw:
+        text = raw.decode("utf-16-le", errors="ignore").strip()
+        if text:
+            return text
+    return raw.decode("utf-8", errors="ignore").strip().lstrip("\ufeff").strip()
+
+
+def _terminal_roots() -> Path | None:
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        return None
+    root = Path(appdata) / "MetaQuotes" / "Terminal"
+    return root if root.is_dir() else None
+
+
+def resolve_mt5_terminal_exe() -> tuple[Path, str]:
+    """Best-effort terminal64.exe when none is configured.
+
+    Order: single running process → origin.txt install dirs (most-recent
+    data folder wins) → default Program Files locations.
+    Returns (exe, source-label). Raises ValueError when ambiguous/missing.
+    """
+    running = [
+        Path(p["path"])
+        for p in list_terminal_processes()
+        if p.get("path") and Path(p["path"]).is_file()
+    ]
+    unique_running = sorted(set(running))
+    if len(unique_running) == 1:
+        return unique_running[0], "auto:running-process"
+    if len(unique_running) > 1:
+        options = "\n".join(f"  - {p}" for p in unique_running)
+        raise ValueError(
+            "Multiple MT5 terminals are running — set terminal64.exe explicitly:\n"
+            + options,
+        )
+
+    root = _terminal_roots()
+    if root is not None:
+        installs: list[tuple[Path, Path]] = []
+        for child in root.iterdir():
+            if not child.is_dir() or child.name in ("Common", "Community", "Help"):
+                continue
+            origin = child / "origin.txt"
+            if not origin.is_file():
+                continue
+            install_dir = Path(_read_origin_id(origin))
+            exe = install_dir / "terminal64.exe"
+            if exe.is_file():
+                installs.append((exe, child))
+        unique_installs = sorted(set(exe for exe, _ in installs))
+        if len(unique_installs) == 1:
+            return unique_installs[0], "auto:origin.txt"
+        if unique_installs:
+            by_mtime = sorted(
+                installs, key=lambda item: item[1].stat().st_mtime, reverse=True,
+            )
+            picked = by_mtime[0][0]
+            candidates = "\n".join(f"  - {exe} (data: {data})" for exe, data in by_mtime)
+            import logging
+            logging.getLogger(__name__).warning(
+                "Multiple MT5 installs found; auto-selected most-recent %s.\n%s",
+                picked, candidates,
+            )
+            return picked, "auto:origin.txt (most-recent)"
+
+    for candidate in MT5_DEFAULT_INSTALL_PATHS:
+        if candidate.is_file():
+            return candidate, "auto:default-install-path"
+
+    raise ValueError(
+        "MetaTrader 5 path is not configured and no terminal64.exe was found — "
+        "set it in Settings (or start MT5 once and retry)",
+    )
 
 
 def resolve_mt5_data_path(terminal_exe: Path) -> Path:
@@ -94,9 +219,7 @@ def resolve_mt5_data_path(terminal_exe: Path) -> Path:
 
     origin = terminal_exe.parent / "origin.txt"
     if origin.is_file():
-        instance_id = origin.read_text(encoding="utf-16-le", errors="ignore").strip()
-        if not instance_id:
-            instance_id = origin.read_text(encoding="utf-8", errors="ignore").strip()
+        instance_id = _read_origin_id(origin)
         candidate = root / instance_id
         if candidate.is_dir():
             return candidate
@@ -115,6 +238,91 @@ def common_files_dir() -> Path:
     if not appdata:
         raise ValueError("APPDATA is not set")
     return Path(appdata) / "MetaQuotes" / "Terminal" / "Common" / "Files"
+
+
+def portable_files_dir(data_path: Path) -> Path:
+    """Files dir for a portable terminal (data lives next to the exe)."""
+    return Path(data_path) / "MQL5" / "Files"
+
+
+def files_base_dir(mt5: Mt5Settings) -> Path:
+    """Primary job/cache base for this terminal mode."""
+    if mt5.portable:
+        return portable_files_dir(mt5.data_path)
+    return common_files_dir()
+
+
+def job_dir_for(mt5: Mt5Settings, job_id: str) -> Path:
+    return files_base_dir(mt5) / JOB_ROOT / job_id
+
+
+def candidate_job_dirs(mt5: Mt5Settings | None, job_id: str) -> list[Path]:
+    """Primary + fallback job dirs (MQL5 writes both, Python polls both)."""
+    dirs: list[Path] = []
+    if mt5 is not None:
+        try:
+            primary = job_dir_for(mt5, job_id)
+        except ValueError:
+            return dirs
+        dirs.append(primary)
+        try:
+            fallback = (
+                common_files_dir() / JOB_ROOT / job_id
+                if mt5.portable
+                else portable_files_dir(mt5.data_path) / JOB_ROOT / job_id
+            )
+        except ValueError:
+            return dirs
+        if fallback != dirs[0]:
+            dirs.append(fallback)
+        return dirs
+    try:
+        dirs.append(common_files_dir() / JOB_ROOT / job_id)
+    except ValueError:
+        pass
+    return dirs
+
+
+def _remove_job_dirs(mt5: Mt5Settings | None, job_id: str, *, prefix_sweep: bool = False) -> None:
+    targets = candidate_job_dirs(mt5, job_id)
+    if prefix_sweep:
+        bases: list[Path] = []
+        if mt5 is not None:
+            try:
+                bases = [files_base_dir(mt5)]
+            except ValueError:
+                bases = []
+            if bases:
+                try:
+                    other = common_files_dir() if mt5.portable else portable_files_dir(mt5.data_path)
+                except ValueError:
+                    other = None
+                if other is not None and other != bases[0]:
+                    bases.append(other)
+        else:
+            try:
+                bases = [common_files_dir()]
+            except ValueError:
+                bases = []
+        for base in bases:
+            root = base / JOB_ROOT
+            if not root.is_dir():
+                continue
+            for child in root.iterdir():
+                if child.is_dir() and child.name.startswith(job_id):
+                    shutil.rmtree(child, ignore_errors=True)
+    for job_dir in targets:
+        if job_dir.exists():
+            shutil.rmtree(job_dir, ignore_errors=True)
+
+
+def parse_progress_file_any(paths: list[Path]) -> dict[str, Any]:
+    """Parse the first non-empty progress.txt across candidate locations."""
+    for path in paths:
+        data = parse_progress_file(path)
+        if data:
+            return data
+    return {}
 
 
 def custom_symbol_name(source_symbol: str, suffix: str) -> str:
@@ -207,10 +415,28 @@ def write_m30_expert_set(path: Path, job_id: str) -> None:
     )
 
 
-def m30_cache_file_path(symbol: str, subfolder: str = M30_CACHE_SUBFOLDER) -> Path:
+def m30_cache_file_path(
+    symbol: str,
+    subfolder: str = M30_CACHE_SUBFOLDER,
+    mt5: Mt5Settings | None = None,
+) -> Path:
     # Keep '.' (e.g. EURUSD.DUK); only strip path-hostile chars — matches M30CacheWarmer.mq5
     safe = symbol.replace(":", "_").replace("\\", "_").replace("/", "_")
-    return common_files_dir() / subfolder / f"M30_{safe}.bin"
+    name = f"M30_{safe}.bin"
+    if mt5 is not None:
+        return files_base_dir(mt5) / subfolder / name
+    return common_files_dir() / subfolder / name
+
+
+def m30_cache_candidates(symbol: str, mt5: Mt5Settings | None = None) -> list[Path]:
+    primary = m30_cache_file_path(symbol, mt5=mt5)
+    candidates = [primary]
+    if mt5 is not None:
+        other_base = common_files_dir() if mt5.portable else portable_files_dir(mt5.data_path)
+        other = other_base / M30_CACHE_SUBFOLDER / primary.name
+        if other != primary:
+            candidates.append(other)
+    return candidates
 
 
 def _compile_mq5(
@@ -326,8 +552,8 @@ def _run_m30_cache_warmup(
         preset="dukascopy_m30.set",
     )
 
-    cache_path = m30_cache_file_path(custom_symbol)
-    launch_mt5_background(mt5.terminal_exe, ini_path)
+    cache_candidates = m30_cache_candidates(custom_symbol, mt5)
+    launch_mt5_background(mt5.terminal_exe, ini_path, portable=mt5.portable)
 
     started = time.monotonic()
     while time.monotonic() - started < M30_WARMUP_TIMEOUT_SEC:
@@ -335,7 +561,11 @@ def _run_m30_cache_warmup(
             kill_mt5_terminal(mt5.terminal_exe)
             raise JobCancelled()
 
-        progress = parse_progress_file(progress_path)
+        progress = parse_progress_file_any([
+            progress_path,
+            *[d / "progress.txt" for d in candidate_job_dirs(mt5, job_id)
+              if (d / "progress.txt") != progress_path],
+        ])
         state = str(progress.get("state", ""))
         phase = str(progress.get("phase", ""))
         if state == "done" and phase == "warm_m30":
@@ -345,7 +575,7 @@ def _run_m30_cache_warmup(
             code = progress.get("error_code", "")
             raise RuntimeError(f"{msg} (error {code})".strip())
 
-        if cache_path.is_file() and cache_path.stat().st_size > 16:
+        if any(p.is_file() and p.stat().st_size > 16 for p in cache_candidates):
             return
 
         if on_progress:
@@ -462,9 +692,7 @@ def cleanup_staging(
     remove_script: bool = False,
 ) -> None:
     if remove_job_files:
-        job_dir = common_files_dir() / JOB_ROOT / job_id
-        if job_dir.exists():
-            shutil.rmtree(job_dir, ignore_errors=True)
+        _remove_job_dirs(mt5, job_id)
 
     if remove_script:
         purge_import_artifacts(mt5)
@@ -530,13 +758,22 @@ def wait_mt5_exit(terminal_exe: Path, timeout_sec: float = 30.0) -> None:
         time.sleep(2.0)
 
 
-def launch_mt5_background(terminal_exe: Path, ini_path: Path) -> None:
+def build_mt5_launch_args(terminal_exe: Path, ini_path: Path, *, portable: bool = False) -> list[str]:
+    args = [str(terminal_exe), f"/config:{ini_path}"]
+    if portable:
+        args.append("/portable")
+    return args
+
+
+def launch_mt5_background(
+    terminal_exe: Path, ini_path: Path, *, portable: bool = False,
+) -> None:
     """Launch MT5 minimized and detached (Windows: cmd start /MIN)."""
     exe_dir = str(terminal_exe.parent)
-    config_arg = f"/config:{ini_path}"
+    launch_args = build_mt5_launch_args(terminal_exe, ini_path, portable=portable)
     if os.name == "nt":
         subprocess.Popen(
-            ["cmd.exe", "/c", "start", "", "/MIN", str(terminal_exe), config_arg],
+            ["cmd.exe", "/c", "start", "", "/MIN", *launch_args],
             cwd=exe_dir,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -550,7 +787,7 @@ def launch_mt5_background(terminal_exe: Path, ini_path: Path) -> None:
         )
         return
     subprocess.Popen(
-        [str(terminal_exe), config_arg],
+        launch_args,
         cwd=exe_dir,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -581,9 +818,13 @@ def abort_mt5_import(
     if terminal is not None:
         kill_mt5_terminal(terminal)
 
-    job_dir = common_files_dir() / JOB_ROOT / job_id
-    if job_dir.exists():
-        shutil.rmtree(job_dir, ignore_errors=True)
+    mt5_for_cleanup: Mt5Settings | None = None
+    if mt5_raw:
+        try:
+            mt5_for_cleanup = Mt5Settings.from_dict(mt5_raw)
+        except ValueError:
+            mt5_for_cleanup = None
+    _remove_job_dirs(mt5_for_cleanup, job_id, prefix_sweep=True)
 
     if mt5_raw:
         try:
@@ -625,6 +866,7 @@ def _wait_for_mt5_import(
     job_id: str,
     terminal_exe: Path,
     custom_name: str,
+    mt5: Mt5Settings | None = None,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
@@ -634,6 +876,12 @@ def _wait_for_mt5_import(
     started = time.monotonic()
     startup_deadline = started + MT5_STARTUP_TIMEOUT_SEC
     saw_progress = False
+    extra_paths: list[Path] = []
+    if mt5 is not None:
+        extra_paths = [
+            d / "progress.txt" for d in candidate_job_dirs(mt5, job_id)
+            if (d / "progress.txt") != progress_path
+        ]
 
     while time.monotonic() - started < IMPORT_TIMEOUT_SEC:
         if should_cancel and should_cancel():
@@ -642,6 +890,8 @@ def _wait_for_mt5_import(
             raise JobCancelled()
 
         final_progress = parse_progress_file(progress_path)
+        if not final_progress and extra_paths:
+            final_progress = parse_progress_file_any(extra_paths)
         if final_progress:
             saw_progress = True
         elif not saw_progress and time.monotonic() > startup_deadline:
@@ -728,7 +978,7 @@ def _import_ticks_locked(
     custom_name = custom_symbol_name(instrument.symbol, mt5.custom_suffix)
     origin = str(mt5_raw.get("origin_symbol") or instrument.symbol).strip() or instrument.symbol
 
-    job_dir = common_files_dir() / JOB_ROOT / job_id
+    job_dir = job_dir_for(mt5, job_id)
     job_dir.mkdir(parents=True, exist_ok=True)
     progress_path = job_dir / "progress.txt"
 
@@ -770,13 +1020,14 @@ def _import_ticks_locked(
                 "custom_symbol": custom_name,
             })
 
-        launch_mt5_background(mt5.terminal_exe, ini_path)
+        launch_mt5_background(mt5.terminal_exe, ini_path, portable=mt5.portable)
 
         final_progress = _wait_for_mt5_import(
             progress_path,
             job_id=job_id,
             terminal_exe=mt5.terminal_exe,
             custom_name=custom_name,
+            mt5=mt5,
             on_progress=on_progress,
             should_cancel=should_cancel,
         )
@@ -919,7 +1170,7 @@ def prepare_and_import(
             batch_sources = sources[offset: offset + MAX_HOUR_FILES_PER_IMPORT]
             batch_ticks = count_ticks_in_files(batch_sources)
             batch_job_id = f"{job_id}-{batch_number:02d}"
-            batch_dir = common_files_dir() / JOB_ROOT / batch_job_id
+            batch_dir = job_dir_for(mt5, batch_job_id)
 
             def batch_publish_progress(snapshot: dict[str, Any]) -> None:
                 if not on_progress:
@@ -1008,6 +1259,96 @@ def prepare_and_import(
         _active_terminal.pop(job_id, None)
         if staging_dir.exists():
             shutil.rmtree(staging_dir, ignore_errors=True)
+
+
+def origin_id_for(terminal_exe: Path) -> str | None:
+    origin = terminal_exe.parent / "origin.txt"
+    if not origin.is_file():
+        return None
+    return _read_origin_id(origin) or None
+
+
+def list_terminal_processes() -> list[dict[str, Any]]:
+    """Best-effort list of running terminal64 processes (Windows only)."""
+    if os.name != "nt":
+        return []
+    script = (
+        "Get-Process -Name 'terminal64' -ErrorAction SilentlyContinue | "
+        "ForEach-Object { $_.Id + '|' + $_.Path }"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    processes: list[dict[str, Any]] = []
+    for line in (result.stdout or "").splitlines():
+        if "|" not in line:
+            continue
+        pid, _, path = line.partition("|")
+        try:
+            processes.append({"pid": int(pid.strip()), "path": path.strip()})
+        except ValueError:
+            continue
+    return processes
+
+
+def diagnose_mt5(mt5_raw: dict[str, Any] | None) -> dict[str, Any]:
+    """Resolve config into inspectable paths without launching MT5."""
+    raw = dict(mt5_raw or {})
+    out: dict[str, Any] = {
+        "portable": _parse_portable(raw.get("portable")),
+        "terminal_configured": str(raw.get("terminal_exe") or ""),
+        "data_path_configured": str(raw.get("data_path") or ""),
+    }
+    if out["terminal_configured"]:
+        out["terminal_source"] = "configured"
+    else:
+        try:
+            _auto_exe, _auto_source = resolve_mt5_terminal_exe()
+            out["terminal_source"] = _auto_source
+        except ValueError:
+            out["terminal_source"] = "auto-detect failed"
+    try:
+        mt5 = Mt5Settings.from_dict(raw)
+    except ValueError as exc:
+        out["ok"] = False
+        out["error"] = str(exc)
+        return out
+    out["terminal_exe"] = str(mt5.terminal_exe)
+    script_ex5 = mt5.data_path / "MQL5" / "Scripts" / "dukascopy" / SCRIPT_EX5_NAME
+    out.update({
+        "ok": True,
+        "mode": "portable" if mt5.portable else "roaming",
+        "terminal_exists": mt5.terminal_exe.is_file(),
+        "data_path": str(mt5.data_path),
+        "data_path_exists": mt5.data_path.is_dir(),
+        "origin_id": origin_id_for(mt5.terminal_exe),
+        "launch_args": build_mt5_launch_args(
+            mt5.terminal_exe, Path("import.ini"), portable=mt5.portable,
+        )[1:],
+        "job_base": str(files_base_dir(mt5)),
+        "script_ex5": str(script_ex5),
+        "script_installed": script_ex5.is_file(),
+        "warnings": [],
+    })
+    warnings: list[str] = []
+    out["warnings"] = warnings
+    if mt5.portable and mt5.data_path.resolve() != mt5.terminal_exe.parent.resolve():
+        warnings.append(
+            "Portable mode expects the data folder to be the terminal folder "
+            f"({mt5.terminal_exe.parent}); imports still run but MQL5 must exist there.",
+        )
+    if not mt5.portable and mt5.data_path.resolve() == mt5.terminal_exe.parent.resolve():
+        warnings.append(
+            "Data folder equals the terminal folder but portable mode is OFF — "
+            "the terminal will use its Roaming data folder instead. "
+            "Enable portable mode or point the data folder at "
+            "%APPDATA%\\MetaQuotes\\Terminal\\<instance>.",
+        )
+    return out
 
 
 assemble_and_import = prepare_and_import

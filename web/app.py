@@ -16,7 +16,7 @@ from core.exceptions import IncompleteDatasetError
 from core.services.gap_scanner import GapScanner, require_complete_import
 from core.services.instrument_search import UnknownInstrumentError
 from core.services.jetta_metadata import fetch_instrument_info
-from export.mt5_importer import kill_mt5_terminal, wait_mt5_exit
+from export.mt5_importer import Mt5Settings, kill_mt5_terminal, wait_mt5_exit
 from export.mt5_symbol_manager import delete_custom_symbol, list_custom_symbols
 from storage.fast_delete import release_import_staging_locks
 from storage.metadata_db import MetadataDB
@@ -118,6 +118,7 @@ class Mt5SettingsUpdate(BaseModel):
     data_path: str | None = None
     custom_suffix: str | None = None
     origin_symbol: str | None = None
+    portable: bool | None = None
 
 
 class AutomationScheduleModel(BaseModel):
@@ -517,8 +518,10 @@ async def start_mt5_import(body: Mt5ImportRequest) -> dict[str, Any]:
 
     store = settings_store()
     mt5_config = store.get_mt5()
-    if not str(mt5_config.get("terminal_exe") or "").strip():
-        raise HTTPException(400, "Configure MetaTrader 5 path in Settings before importing")
+    try:
+        Mt5Settings.validate_config(mt5_config)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
     metadata = db()
     inst = _require_library_symbol(body.symbol, metadata)
@@ -554,6 +557,16 @@ def api_list_mt5_custom_symbols() -> dict[str, Any]:
     return {"symbols": db().list_mt5_custom_symbols()}
 
 
+@app.get("/api/mt5/diagnostics")
+def api_mt5_diagnostics() -> dict[str, Any]:
+    from export.mt5_importer import diagnose_mt5, list_terminal_processes
+
+    mt5_config = settings_store().get_mt5()
+    diag = diagnose_mt5(mt5_config)
+    diag["running_terminals"] = list_terminal_processes()
+    return diag
+
+
 def _guess_source_symbol(custom_name: str, suffix: str) -> str:
     suffix = suffix.strip()
     if suffix and not suffix.startswith("."):
@@ -570,8 +583,10 @@ def api_refresh_mt5_custom_symbols() -> dict[str, Any]:
 
     store = settings_store()
     mt5_config = store.get_mt5()
-    if not str(mt5_config.get("terminal_exe") or "").strip():
-        raise HTTPException(400, "Configure MetaTrader 5 path in Settings")
+    try:
+        Mt5Settings.validate_config(mt5_config)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
     suffix = str(mt5_config.get("custom_suffix") or ".DUK").strip() or ".DUK"
     try:
@@ -601,8 +616,10 @@ def api_delete_mt5_custom_symbol(symbol: str) -> dict[str, Any]:
 
     store = settings_store()
     mt5_config = store.get_mt5()
-    if not str(mt5_config.get("terminal_exe") or "").strip():
-        raise HTTPException(400, "Configure MetaTrader 5 path in Settings")
+    try:
+        Mt5Settings.validate_config(mt5_config)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
     try:
         delete_custom_symbol(mt5_config, settings().data_dir, symbol)

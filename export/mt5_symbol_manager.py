@@ -16,11 +16,14 @@ from export.mt5_importer import (
     MT5_BUNDLE_DIR,
     Mt5Settings,
     SCRIPT_MQ5_NAME,
+    candidate_job_dirs,
     common_files_dir,
     ensure_script_installed,
+    job_dir_for,
     kill_mt5_terminal,
     launch_mt5_background,
     parse_progress_file,
+    parse_progress_file_any,
     wait_mt5_exit,
     write_manifest,
     write_script_set,
@@ -30,6 +33,13 @@ from export.mt5_importer import (
 logger = logging.getLogger(__name__)
 
 MANAGER_TIMEOUT_SEC = 10 * 60
+
+
+def _mt5_or_none(mt5_raw: dict[str, Any]) -> Mt5Settings | None:
+    try:
+        return Mt5Settings.from_dict(mt5_raw)
+    except ValueError:
+        return None
 
 
 class Mt5JobError(RuntimeError):
@@ -132,8 +142,14 @@ def _parse_symbols_file(path: Path) -> list[CustomSymbolInfo]:
 def _wait_for_manager(progress_path: Path, job_dir: Path, mt5: Mt5Settings) -> dict[str, Any]:
     started = time.monotonic()
     last_log_at = 0.0
+    alternates = [
+        d / "progress.txt" for d in candidate_job_dirs(mt5, job_dir.name)
+        if (d / "progress.txt") != progress_path
+    ]
     while time.monotonic() - started < MANAGER_TIMEOUT_SEC:
         progress = parse_progress_file(progress_path)
+        if not progress and alternates:
+            progress = parse_progress_file_any(alternates)
         state = str(progress.get("state", ""))
         if state in ("done", "error"):
             return progress
@@ -166,7 +182,7 @@ def _run_symbol_job(
     job_id = manifest["job_id"]
     action = manifest.get("action", "import")
     mt5 = Mt5Settings.from_dict(mt5_raw)
-    job_dir = common_files_dir() / JOB_ROOT / job_id
+    job_dir = job_dir_for(mt5, job_id)
     job_dir.mkdir(parents=True, exist_ok=True)
     progress_path = job_dir / "progress.txt"
     staging_dir = settings_data_dir / "mt5_staging" / job_id
@@ -196,7 +212,7 @@ def _run_symbol_job(
 
         kill_mt5_terminal(mt5.terminal_exe)
         wait_mt5_exit(mt5.terminal_exe)
-        launch_mt5_background(mt5.terminal_exe, ini_path)
+        launch_mt5_background(mt5.terminal_exe, ini_path, portable=mt5.portable)
         logger.info("MT5 launched with config %s", ini_path)
 
         final = _wait_for_manager(progress_path, job_dir, mt5)
@@ -234,13 +250,23 @@ def list_custom_symbols(mt5_raw: dict[str, Any], settings_data_dir: Path) -> lis
         "suffix": suffix,
     }
 
-    job_dir = common_files_dir() / JOB_ROOT / job_id
+    job_dirs = candidate_job_dirs(_mt5_or_none(mt5_raw), job_id)
     try:
         _run_symbol_job(mt5_raw, settings_data_dir, manifest, chart_symbol="EURUSD")
-        return [s.to_dict() for s in _parse_symbols_file(job_dir / "symbols.txt")]
+        for job_dir in job_dirs:
+            symbols_file = job_dir / "symbols.txt"
+            if symbols_file.is_file():
+                return [s.to_dict() for s in _parse_symbols_file(symbols_file)]
+        if not job_dirs:
+            raise Mt5JobError("MT5 list job produced no symbols.txt (no job folder available)")
+        raise Mt5JobError(
+            "MT5 list job produced no symbols.txt",
+            job_dir=job_dirs[0],
+        )
     finally:
-        if job_dir.exists():
-            shutil.rmtree(job_dir, ignore_errors=True)
+        for job_dir in job_dirs:
+            if job_dir.exists():
+                shutil.rmtree(job_dir, ignore_errors=True)
 
 
 def delete_custom_symbol(
@@ -254,7 +280,8 @@ def delete_custom_symbol(
         "action": "delete",
         "symbol": symbol,
     }
-    job_dir = common_files_dir() / JOB_ROOT / job_id
+    job_dirs = candidate_job_dirs(_mt5_or_none(mt5_raw), job_id)
+    job_dir = job_dirs[0] if job_dirs else None
     ok = False
     try:
         _run_symbol_job(mt5_raw, settings_data_dir, manifest, chart_symbol="EURUSD")
@@ -272,8 +299,9 @@ def delete_custom_symbol(
             + (f"\nJob artifacts: {exc.job_dir}" if exc.job_dir else ""),
         ) from exc
     finally:
-        if job_dir.exists():
-            if ok:
-                shutil.rmtree(job_dir, ignore_errors=True)
-            else:
-                logger.error("MT5 delete job artifacts kept at %s", job_dir)
+        for job_dir in job_dirs:
+            if job_dir.exists():
+                if ok:
+                    shutil.rmtree(job_dir, ignore_errors=True)
+                else:
+                    logger.error("MT5 delete job artifacts kept at %s", job_dir)

@@ -6,6 +6,9 @@
     python main.py gaps     <SYMBOL> --all [--repair]
     python main.py status   <SYMBOL>
     python main.py export-csv <SYMBOL> <START> <END> [--output PATH]
+    python main.py mt5-config [--show] [--terminal PATH] [--data PATH]
+                     [--portable | --roaming] [--suffix SUF] [--origin SYM]
+    python main.py mt5-doctor
     python main.py migrate  [--dry-run] [--keep-parquet]
     python main.py web      [--host HOST] [--port PORT]
 """
@@ -127,6 +130,20 @@ def _build_parser() -> argparse.ArgumentParser:
     p_web = sub.add_parser("web", help="start the web UI")
     p_web.add_argument("--host", default="127.0.0.1")
     p_web.add_argument("--port", type=int, default=8080)
+
+    p_mt5 = sub.add_parser("mt5-config", help="show or update MT5 terminal settings")
+    p_mt5.add_argument("--show", action="store_true", help="print current MT5 settings")
+    p_mt5.add_argument("--terminal", default=None, help="path to terminal64.exe")
+    p_mt5.add_argument("--data", default=None, help="MT5 data folder (empty string clears it)")
+    p_mt5.add_argument("--suffix", default=None, help="custom symbol suffix (e.g. .DUK)")
+    p_mt5.add_argument("--origin", default=None, help="origin symbol override (empty clears it)")
+    mode = p_mt5.add_mutually_exclusive_group()
+    mode.add_argument("--portable", action="store_true", default=None,
+                      help="portable terminal: data lives next to terminal64.exe, launch with /portable")
+    mode.add_argument("--roaming", action="store_true",
+                      help="normal install (default): data in %%APPDATA%%")
+
+    sub.add_parser("mt5-doctor", help="diagnose MT5 terminal/data-folder configuration")
 
     return parser
 
@@ -390,6 +407,75 @@ def cmd_export_csv(settings: Settings, catalog: InstrumentCatalog, args) -> int:
     return 0
 
 
+def cmd_mt5_config(settings: Settings, args) -> int:
+    import json
+
+    from web.settings_store import SettingsStore
+
+    store = SettingsStore(settings.data_dir / "web_settings.json")
+    patch: dict = {}
+    if args.terminal is not None:
+        patch["terminal_exe"] = args.terminal.strip()
+    if args.data is not None:
+        patch["data_path"] = args.data.strip()
+    if args.suffix is not None:
+        suffix = args.suffix.strip() or ".DUK"
+        patch["custom_suffix"] = suffix if suffix.startswith(".") else "." + suffix
+    if args.origin is not None:
+        patch["origin_symbol"] = args.origin.strip()
+    if args.portable:
+        patch["portable"] = True
+    elif args.roaming:
+        patch["portable"] = False
+    if patch:
+        mt5 = store.set_mt5(patch)
+        print("Updated MT5 settings:")
+    else:
+        mt5 = store.get_mt5()
+    print(json.dumps(mt5, indent=2))
+    if not args.show and not patch:
+        print("\nHint: python main.py mt5-config --show  |  --terminal PATH --data PATH --portable/--roaming")
+    return 0
+
+
+def cmd_mt5_doctor(settings: Settings) -> int:
+    from export.mt5_importer import diagnose_mt5, list_terminal_processes
+    from web.settings_store import SettingsStore
+
+    store = SettingsStore(settings.data_dir / "web_settings.json")
+    diag = diagnose_mt5(store.get_mt5())
+    print(f"mode            : {diag.get('mode', '?')} (default roaming)")
+    source = diag.get("terminal_source") or "configured"
+    terminal_display = diag.get("terminal_exe") or "(auto-detect failed)"
+    missing_marker = ""
+    if diag.get("terminal_exe") and not diag.get("terminal_exists"):
+        missing_marker = "  [MISSING]"
+    print(f"terminal        : {terminal_display} [{source}]{missing_marker}")
+    print(f"data folder     : {diag.get('data_path') or diag.get('data_path_configured') or '(auto)'}")
+    if diag.get("origin_id"):
+        print(f"origin.txt      : {diag['origin_id']}")
+    if diag.get("launch_args"):
+        print(f"launch flags    : {' '.join(diag['launch_args'])}")
+    if diag.get("job_base"):
+        print(f"job folder base : {diag['job_base']}")
+    if diag.get("script_ex5"):
+        print(f"import script   : {diag['script_ex5']}"
+              f"{'' if diag.get('script_installed') else '  [not installed yet — copied on first import]'}")
+    for warning in diag.get("warnings", []):
+        print(f"WARNING         : {warning}")
+    if diag.get("error"):
+        print(f"ERROR           : {diag['error']}")
+        return 1
+    processes = list_terminal_processes()
+    if processes:
+        print(f"running         : {len(processes)} terminal64 process(es)")
+        for proc in processes[:10]:
+            print(f"  PID {proc['pid']}  {proc['path']}")
+    else:
+        print("running         : no terminal64 process detected")
+    return 0
+
+
 def cmd_web(args) -> int:
     import logging
 
@@ -448,6 +534,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_export_csv(settings, catalog, args)
         if args.command == "migrate":
             return cmd_migrate(settings, args)
+        if args.command == "mt5-config":
+            return cmd_mt5_config(settings, args)
+        if args.command == "mt5-doctor":
+            return cmd_mt5_doctor(settings)
         if args.command == "web":
             return cmd_web(args)
     except UnknownInstrumentError as exc:
