@@ -332,7 +332,14 @@ class JettaClient {
       }
     }
 
-    const response = await fetch(url);
+    const response = await fetch(url, {
+      headers: {
+        Accept: 'application/json, text/plain, */*',
+        // JETTA is behind AWS WAF: no Referer -> 202 challenge, empty body.
+        Referer: 'https://www.dukascopy.com/',
+        Origin: 'https://www.dukascopy.com',
+      },
+    });
     let body;
     try {
       body = await response.json();
