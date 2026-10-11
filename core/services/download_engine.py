@@ -33,6 +33,9 @@ from storage.tick_storage import TickStorage
 
 _RETRYABLE_HTTP = {408, 425, 429, 500, 502, 503, 504}
 _PROFILE_RECENT_LIMIT = 80
+# 429 cooldown when the server sends no Retry-After header.
+_THROTTLE_DEFAULT_SECONDS = 5.0
+_THROTTLE_MAX_SECONDS = 60.0
 
 
 def _profile_entry(task: HourTask) -> dict:
@@ -80,6 +83,24 @@ class DownloadStats:
         self.failed_tasks.extend(other.failed_tasks)
 
 
+def _retry_after_seconds(value: str | None) -> float:
+    """Parse a Retry-After header; fall back to a sane default when absent."""
+    if value:
+        try:
+            return max(0.0, min(float(value.strip()), _THROTTLE_MAX_SECONDS))
+        except ValueError:
+            pass
+        try:
+            from email.utils import parsedate_to_datetime
+
+            retry_at = parsedate_to_datetime(value.strip())
+            delay = (retry_at.timestamp() - time.time())
+            return max(0.0, min(delay, _THROTTLE_MAX_SECONDS))
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return _THROTTLE_DEFAULT_SECONDS
+
+
 class DownloadEngine:
     def __init__(self, settings: Settings, storage: TickStorage, db: MetadataDB):
         self.settings = settings
@@ -94,8 +115,28 @@ class DownloadEngine:
         self._should_cancel: Callable[[], bool] | None = None
         self._refetch = False
         self._profile = False
+        # Pool-wide rate-limit cooldown: a 429 from any worker pauses all
+        # workers so retries don't keep tripping the throttle together.
+        self._throttle_until = 0.0
+        self._throttle_lock = threading.Lock()
+
+    def _wait_if_throttled(self) -> None:
+        while True:
+            with self._throttle_lock:
+                wait = self._throttle_until - time.monotonic()
+            if wait <= 0:
+                return
+            time.sleep(min(wait, 1.0))
+
+    def _cool_down(self, delay: float) -> None:
+        with self._throttle_lock:
+            self._throttle_until = max(
+                self._throttle_until, time.monotonic() + delay,
+            )
+        time.sleep(delay)
 
     def _fetch_body(self, url: str) -> tuple[bytes | None, float]:
+        self._wait_if_throttled()
         started = time.perf_counter()
         try:
             response = worker_session(self.settings).get(
@@ -110,6 +151,18 @@ class DownloadEngine:
             return response.content, fetch_ms
         if status == 404:
             return None, fetch_ms
+        if status == 202:
+            # AWS WAF/CloudFront challenge (empty body). Normally avoided by
+            # sending a browser Referer (see http_client); if seen, the
+            # request was blocked, not just throttled — fail fast with a hint.
+            raise PermanentError(
+                "HTTP 202 (WAF challenge — request blocked, check Referer headers)"
+            )
+        if status == 429:
+            # Slow the whole pool down before retrying, honoring Retry-After.
+            delay = _retry_after_seconds(response.headers.get("Retry-After"))
+            self._cool_down(delay)
+            raise RetryableError(f"HTTP 429 (rate limited, waited {delay:.0f}s)")
         if status in _RETRYABLE_HTTP:
             raise RetryableError(f"HTTP {status}")
         raise PermanentError(f"HTTP {status}")

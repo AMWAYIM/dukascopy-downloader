@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -42,6 +43,16 @@ CREATE TABLE IF NOT EXISTS mt5_custom_symbol (
 # Completed hours are never overwritten with a worse outcome.
 _COMPLETED = TaskStatus.COMPLETED.value
 
+# Cross-process write contention (e.g. CLI + web server on the same data dir)
+# surfaces as "database is locked". SQLite waits `timeout` before giving up;
+# web-facing writes additionally retry a few times on top of that.
+_BUSY_TIMEOUT_MS = 30_000
+_LOCKED_RETRIES = 3
+
+
+def _is_locked_error(exc: Exception) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
+
 
 def _hour_key(hour: datetime) -> str:
     return hour.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:00:00")
@@ -51,13 +62,36 @@ class MetadataDB:
     def __init__(self, db_path: Path):
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        self._conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=30.0)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
         self._uncommitted = 0
         self._commit_every = 32
+
+    def _with_locked_retry(self, fn) -> None:
+        """Run fn(), retrying through momentary cross-process DB locks.
+
+        A failed write leaves a stale snapshot behind; roll back before
+        retrying or every later attempt fails instantly with the same error.
+        (fn releases self._lock as its exception propagates, so taking it
+        here for the rollback cannot deadlock.)
+        """
+        for attempt in range(_LOCKED_RETRIES + 1):
+            try:
+                fn()
+                return
+            except sqlite3.OperationalError as exc:
+                if not _is_locked_error(exc) or attempt >= _LOCKED_RETRIES:
+                    raise
+                with self._lock:
+                    try:
+                        self._conn.rollback()
+                    except sqlite3.Error:
+                        pass
+                time.sleep(2.0 * (attempt + 1))
 
     def close(self) -> None:
         with self._lock:
@@ -76,41 +110,48 @@ class MetadataDB:
     ) -> None:
         key = _hour_key(hour)
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT status, attempts FROM hour_status WHERE instrument=? AND hour_utc=?",
-                (instrument_id, key),
-            ).fetchone()
-            if row is not None and row[0] == _COMPLETED and status != TaskStatus.COMPLETED:
-                return  # never downgrade completed data
-            attempts = (row[1] if row else 0) + 1
-            self._conn.execute(
-                """
-                INSERT INTO hour_status
-                    (instrument, hour_utc, status, tick_count, file_path,
-                     attempts, last_error, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (instrument, hour_utc) DO UPDATE SET
-                    status=excluded.status,
-                    tick_count=excluded.tick_count,
-                    file_path=excluded.file_path,
-                    attempts=excluded.attempts,
-                    last_error=excluded.last_error,
-                    updated_at=excluded.updated_at
-                """,
-                (instrument_id, key, status.value, tick_count, file_path,
-                 attempts, error, now),
-            )
-            self._uncommitted += 1
-            if self._uncommitted >= self._commit_every:
-                self._conn.commit()
-                self._uncommitted = 0
+
+        def _do_mark() -> None:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT status, attempts FROM hour_status WHERE instrument=? AND hour_utc=?",
+                    (instrument_id, key),
+                ).fetchone()
+                if row is not None and row[0] == _COMPLETED and status != TaskStatus.COMPLETED:
+                    return  # never downgrade completed data
+                attempts = (row[1] if row else 0) + 1
+                self._conn.execute(
+                    """
+                    INSERT INTO hour_status
+                        (instrument, hour_utc, status, tick_count, file_path,
+                         attempts, last_error, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (instrument, hour_utc) DO UPDATE SET
+                        status=excluded.status,
+                        tick_count=excluded.tick_count,
+                        file_path=excluded.file_path,
+                        attempts=excluded.attempts,
+                        last_error=excluded.last_error,
+                        updated_at=excluded.updated_at
+                    """,
+                    (instrument_id, key, status.value, tick_count, file_path,
+                     attempts, error, now),
+                )
+                self._uncommitted += 1
+                if self._uncommitted >= self._commit_every:
+                    self._conn.commit()
+                    self._uncommitted = 0
+
+        self._with_locked_retry(_do_mark)
 
     def flush(self) -> None:
-        with self._lock:
-            if self._uncommitted:
-                self._conn.commit()
-                self._uncommitted = 0
+        def _do_flush() -> None:
+            with self._lock:
+                if self._uncommitted:
+                    self._conn.commit()
+                    self._uncommitted = 0
+
+        self._with_locked_retry(_do_flush)
 
     # -- reads -------------------------------------------------------------
 
@@ -153,14 +194,21 @@ class MetadataDB:
 
     def delete_instrument(self, instrument_id: str) -> int:
         """Remove all ledger rows for an instrument. Returns rows deleted."""
-        with self._lock:
-            cur = self._conn.execute(
-                "DELETE FROM hour_status WHERE instrument=?",
-                (instrument_id,),
-            )
-            self._conn.commit()
-            self._uncommitted = 0
-            return cur.rowcount
+        deleted = 0
+
+        def _do_delete() -> None:
+            nonlocal deleted
+            with self._lock:
+                cur = self._conn.execute(
+                    "DELETE FROM hour_status WHERE instrument=?",
+                    (instrument_id,),
+                )
+                self._conn.commit()
+                self._uncommitted = 0
+                deleted = cur.rowcount
+
+        self._with_locked_retry(_do_delete)
+        return deleted
 
     def list_completed_hours(
         self,
@@ -324,41 +372,48 @@ class MetadataDB:
         mark_imported: bool = False,
     ) -> None:
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        with self._lock:
-            existing = self._conn.execute(
-                "SELECT imported_at FROM mt5_custom_symbol WHERE symbol=?",
-                (symbol,),
-            ).fetchone()
-            imported_at = now if mark_imported else (existing[0] if existing else None)
-            self._conn.execute(
-                """
-                INSERT INTO mt5_custom_symbol (
-                    symbol, source_symbol, ticks, first_ms, last_ms,
-                    range_label, imported_at, synced_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(symbol) DO UPDATE SET
-                    source_symbol=excluded.source_symbol,
-                    ticks=excluded.ticks,
-                    first_ms=excluded.first_ms,
-                    last_ms=excluded.last_ms,
-                    range_label=COALESCE(excluded.range_label, mt5_custom_symbol.range_label),
-                    imported_at=COALESCE(excluded.imported_at, mt5_custom_symbol.imported_at),
-                    synced_at=excluded.synced_at
-                """,
-                (
-                    symbol,
-                    source_symbol,
-                    ticks,
-                    first_ms,
-                    last_ms,
-                    range_label,
-                    imported_at,
-                    now,
-                ),
-            )
-            self._uncommitted += 1
+
+        def _do_upsert() -> None:
+            with self._lock:
+                existing = self._conn.execute(
+                    "SELECT imported_at FROM mt5_custom_symbol WHERE symbol=?",
+                    (symbol,),
+                ).fetchone()
+                imported_at = now if mark_imported else (existing[0] if existing else None)
+                self._conn.execute(
+                    """
+                    INSERT INTO mt5_custom_symbol (
+                        symbol, source_symbol, ticks, first_ms, last_ms,
+                        range_label, imported_at, synced_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(symbol) DO UPDATE SET
+                        source_symbol=excluded.source_symbol,
+                        ticks=excluded.ticks,
+                        first_ms=excluded.first_ms,
+                        last_ms=excluded.last_ms,
+                        range_label=COALESCE(excluded.range_label, mt5_custom_symbol.range_label),
+                        imported_at=COALESCE(excluded.imported_at, mt5_custom_symbol.imported_at),
+                        synced_at=excluded.synced_at
+                    """,
+                    (
+                        symbol,
+                        source_symbol,
+                        ticks,
+                        first_ms,
+                        last_ms,
+                        range_label,
+                        imported_at,
+                        now,
+                    ),
+                )
+                self._uncommitted += 1
+
+        self._with_locked_retry(_do_upsert)
 
     def delete_mt5_custom_symbol(self, symbol: str) -> None:
-        with self._lock:
-            self._conn.execute("DELETE FROM mt5_custom_symbol WHERE symbol=?", (symbol,))
-            self._uncommitted += 1
+        def _do_delete() -> None:
+            with self._lock:
+                self._conn.execute("DELETE FROM mt5_custom_symbol WHERE symbol=?", (symbol,))
+                self._uncommitted += 1
+
+        self._with_locked_retry(_do_delete)

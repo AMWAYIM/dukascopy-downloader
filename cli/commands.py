@@ -390,19 +390,79 @@ def cmd_export_csv(settings: Settings, catalog: InstrumentCatalog, args) -> int:
     return 0
 
 
+def _acquire_data_dir_lock(data_dir) -> object | None:
+    """Hold an exclusive lock so two servers can't share one data directory.
+
+    Returns the open lock handle (keep it alive for the server's lifetime),
+    or None when another process already holds the lock. The OS releases the
+    lock automatically if the process dies, so it can never go stale.
+    """
+    from pathlib import Path
+
+    import os as _os
+
+    lock_path = Path(data_dir) / ".web.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+b")
+    try:
+        # Note: on Windows a contested lock does not always make locking()
+        # itself raise — the following write into the locked region then fails
+        # with PermissionError. So the whole acquire sequence is guarded.
+        # Seek to a fixed offset first: in append mode the initial position
+        # is at end-of-file, so without this each process would lock a
+        # different byte and never conflict.
+        handle.seek(0)
+        if _os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        handle.seek(0)
+        handle.truncate(0)
+        # Leading newline: the lock covers byte 0, so a refused second
+        # server can still read the holder PID from offset 1.
+        handle.write(f"\n{_os.getpid()}".encode("ascii"))
+        handle.flush()
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
 def cmd_web(args) -> int:
     import logging
+    import os
 
     import uvicorn
+
+    from config.settings import Settings as _Settings
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(levelname)s %(name)s: %(message)s",
     )
 
+    settings = _Settings()
+    lock_handle = _acquire_data_dir_lock(settings.data_dir)
+    if lock_handle is None:
+        # Note: the lock file can't be read while held, so no holder PID.
+        print(
+            f"error: another web server is already using this data directory "
+            f"({settings.data_dir}). Stop it first - running two servers "
+            f"corrupts job state and locks the database.",
+            file=sys.stderr,
+        )
+        return 1
+
     port = _resolve_web_port(args.host, args.port)
-    print(f"Web UI: http://{args.host}:{port}")
-    uvicorn.run("web.app:app", host=args.host, port=port, reload=False)
+    print(f"Web UI: http://{args.host}:{port} (PID {os.getpid()})")
+    try:
+        uvicorn.run("web.app:app", host=args.host, port=port, reload=False)
+    finally:
+        lock_handle.close()
     return 0
 
 

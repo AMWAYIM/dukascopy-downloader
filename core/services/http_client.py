@@ -20,6 +20,11 @@ def _build_session(settings: Settings) -> requests.Session:
             "User-Agent": settings.user_agent,
             "Connection": "keep-alive",
             "Accept-Encoding": "gzip, deflate",
+            "Accept": "application/json, text/plain, */*",
+            # JETTA sits behind AWS WAF/CloudFront: requests without a
+            # browser Referer get a 202 challenge with an empty body.
+            "Referer": "https://www.dukascopy.com/",
+            "Origin": "https://www.dukascopy.com",
         },
     )
     # One host (jetta.dukascopy.com); each thread runs one request at a time.

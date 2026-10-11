@@ -44,7 +44,17 @@ def fetch_instrument_info(
 
     url = f"{base_url.rstrip('/')}/instruments/{key}"
     try:
-        response = requests.get(url, timeout=timeout)
+        response = requests.get(
+            url,
+            timeout=timeout,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json, text/plain, */*",
+                # Same AWS WAF bypass as http_client: no Referer -> 202 challenge.
+                "Referer": "https://www.dukascopy.com/",
+                "Origin": "https://www.dukascopy.com",
+            },
+        )
         response.raise_for_status()
         payload = response.json()
     except requests.RequestException as exc:
