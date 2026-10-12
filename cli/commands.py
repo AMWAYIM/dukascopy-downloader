@@ -173,6 +173,7 @@ def cmd_download(settings: Settings, catalog: InstrumentCatalog, args) -> int:
     instrument = catalog.get(args.symbol)
     _validate_range(args.start, args.end)
     local_settings = settings.for_job(args.workers)
+    _warn_if_web_running(settings)
 
     db = MetadataDB(settings.db_path)
     storage = TickStorage(settings.data_dir)
@@ -226,6 +227,9 @@ def cmd_gaps(settings: Settings, catalog: InstrumentCatalog, args) -> int:
         raise SystemExit("error: --all cannot be combined with start/end dates")
     if not args.all and (args.start is None or args.end is None):
         raise SystemExit("error: start and end dates are required (or use --all)")
+
+    if args.repair:
+        _warn_if_web_running(settings)
 
     db = MetadataDB(settings.db_path)
     scanner = GapScanner(settings, db)
@@ -476,6 +480,81 @@ def cmd_mt5_doctor(settings: Settings) -> int:
     return 0
 
 
+def _try_nonblocking_lock(handle) -> bool:
+    """Try to claim byte 0 non-blocking. True when the claim succeeded.
+
+    Single shared helper for both the server acquire path and the CLI
+    probe, so platform quirks stay in one place. Caller decides whether
+    a False means "already held" or "probe says locked".
+
+    Append-mode note: the acquire path opens the lock file ``a+b``, where
+    every write goes to EOF regardless of ``seek(0)``. That is safe here
+    only because the acquire path truncates + rewrites the PID immediately
+    after this helper succeeds — the probe itself opens ``r+b`` and never
+    truncates.
+    """
+    import os as _os
+
+    handle.seek(0)
+    if _os.name == "nt":
+        import msvcrt
+
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        # On Windows a contested lock does not always make locking()
+        # itself raise — a write into the locked region then fails with
+        # PermissionError. Mirror the acquire-path check with a
+        # non-destructive read + write-back of the same byte.
+        try:
+            handle.seek(0)
+            current = handle.read(1)
+            handle.seek(0)
+            if current:
+                handle.write(current)
+            else:
+                # Empty file (e.g. holder is between truncate and PID
+                # write): a bare locking() claim is not a reliable signal,
+                # so probe the region with a write and restore emptiness.
+                handle.write(b"\x00")
+            handle.flush()
+            if not current:
+                handle.seek(0)
+                handle.truncate(0)
+                handle.flush()
+        except OSError:
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+            return False
+        return True
+    import fcntl
+
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
+
+def _release_nonblocking_lock(handle) -> None:
+    """Release a byte-0 claim acquired via _try_nonblocking_lock."""
+    import os as _os
+
+    try:
+        if _os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+
 def _acquire_data_dir_lock(data_dir) -> object | None:
     """Hold an exclusive lock so two servers can't share one data directory.
 
@@ -491,21 +570,12 @@ def _acquire_data_dir_lock(data_dir) -> object | None:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = open(lock_path, "a+b")
     try:
-        # Note: on Windows a contested lock does not always make locking()
-        # itself raise — the following write into the locked region then fails
-        # with PermissionError. So the whole acquire sequence is guarded.
         # Seek to a fixed offset first: in append mode the initial position
         # is at end-of-file, so without this each process would lock a
-        # different byte and never conflict.
-        handle.seek(0)
-        if _os.name == "nt":
-            import msvcrt
-
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # different byte and never conflict. The shared helper also covers
+        # the Windows quirk where a contested lock only fails on write.
+        if not _try_nonblocking_lock(handle):
+            raise OSError("data directory lock is held by another process")
         handle.seek(0)
         handle.truncate(0)
         # Leading newline: the lock covers byte 0, so a refused second
@@ -516,6 +586,54 @@ def _acquire_data_dir_lock(data_dir) -> object | None:
         handle.close()
         return None
     return handle
+
+
+def is_data_dir_locked(data_dir) -> bool:
+    """Non-destructive probe: True when a web server currently holds the lock.
+
+    Opens a separate descriptor and tries a non-blocking lock on the same
+    byte — never truncates holder content or changes a byte (on Windows it
+    performs a same-byte write-back to detect mandatory locks, touching
+    mtime only). Used to warn CLI downloads about DB contention with a
+    running server.
+    """
+    from pathlib import Path
+
+    lock_path = Path(data_dir) / ".web.lock"
+    if not lock_path.exists():
+        return False
+    try:
+        handle = open(lock_path, "r+b")
+    except FileNotFoundError:
+        return False
+    except PermissionError:
+        # Cannot open: either an ACL/read-only FS or a Windows mandatory
+        # lock on the open itself. Bias toward warning (the safe direction
+        # for a non-blocking advisory check).
+        return True
+    except OSError:
+        return False
+    try:
+        try:
+            claimed = _try_nonblocking_lock(handle)
+        except OSError:
+            return False
+        if claimed:
+            _release_nonblocking_lock(handle)
+            return False
+        return True
+    finally:
+        handle.close()
+
+
+def _warn_if_web_running(settings: Settings) -> None:
+    if is_data_dir_locked(settings.data_dir):
+        print(
+            "warning: the web server is running on this data directory — "
+            "concurrent downloads contend on the database and will be slower. "
+            "Stop the server first for maximum throughput.",
+            file=sys.stderr,
+        )
 
 
 def cmd_web(args) -> int:
