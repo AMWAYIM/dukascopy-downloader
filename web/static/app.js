@@ -975,6 +975,30 @@ async function loadLibrary() {
 
 let customSymbolsLoading = false;
 
+function fmtSyncTime(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return String(iso);
+  try {
+    return d.toLocaleString(undefined, { timeZoneName: "short" });
+  } catch {
+    return d.toLocaleString();
+  }
+}
+
+function lastSyncedAt(symbols) {
+  let latestMs = NaN;
+  let latest = "";
+  for (const s of symbols || []) {
+    const ms = s && s.synced_at ? Date.parse(s.synced_at) : NaN;
+    if (!Number.isNaN(ms) && (Number.isNaN(latestMs) || ms > latestMs)) {
+      latestMs = ms;
+      latest = s.synced_at;
+    }
+  }
+  return latest;
+}
+
 function renderCustomSymbolsTable(symbols) {
   const tableEl = $("#sym-table");
   if (!symbols.length) {
@@ -982,7 +1006,7 @@ function renderCustomSymbolsTable(symbols) {
       '<p class="empty">No custom symbols yet. Import ticks to MT5 or click Refresh from MT5 to sync.</p>';
     return;
   }
-  tableEl.innerHTML = `<table><thead><tr><th>Symbol</th><th>Source</th><th>Ticks in MT5</th><th>First tick (UTC)</th><th>Last tick (UTC)</th><th></th></tr></thead><tbody>${symbols
+  tableEl.innerHTML = `<table><thead><tr><th>Symbol</th><th>Source</th><th>Ticks in MT5</th><th>First tick (UTC)</th><th>Last tick (UTC)</th><th>Last synced</th><th></th></tr></thead><tbody>${symbols
     .map(
       (s) => `<tr>
           <td><strong>${s.symbol}</strong></td>
@@ -990,6 +1014,7 @@ function renderCustomSymbolsTable(symbols) {
           <td>${fmt(s.ticks)}</td>
           <td class="hint">${s.first_utc || "—"}</td>
           <td class="hint">${s.last_utc || "—"}</td>
+          <td class="hint">${fmtSyncTime(s.synced_at)}</td>
           <td class="lib-actions"><button type="button" class="job-cancel sym-delete" data-delete-symbol="${s.symbol}" aria-label="Delete ${s.symbol}">×</button></td>
         </tr>`,
     )
@@ -1004,14 +1029,34 @@ async function loadCustomSymbols() {
   const tableEl = $("#sym-table");
   try {
     const { symbols } = await api("/api/mt5/custom-symbols");
-    statusEl.textContent = symbols.length
-      ? `${symbols.length} symbol(s) · cached locally`
-      : "";
-    renderCustomSymbolsTable(symbols || []);
+    const list = symbols || [];
+    if (!list.length) {
+      statusEl.textContent = "No custom symbols cached — click Refresh from MT5 to sync.";
+    } else {
+      const last = lastSyncedAt(list);
+      statusEl.textContent = last
+        ? `${list.length} symbol(s) · cached locally, last synced ${fmtSyncTime(last)} — Refresh from MT5 if MT5 changed since`
+        : `${list.length} symbol(s) · cached locally, never synced — click Refresh from MT5`;
+    }
+    renderCustomSymbolsTable(list);
   } catch (e) {
     statusEl.textContent = "";
     tableEl.innerHTML = `<p class="empty">${e.message}</p>`;
   }
+}
+
+async function maybeConfirmEmptyPrune(res) {
+  // MT5 reported zero live symbols but the cache was left untouched:
+  // offer an explicit clear instead of silently keeping stale rows.
+  if (res.live_count !== 0 || res.pruned_empty || !(res.symbols || []).length) return false;
+  return appConfirm({
+    title: "Clear cached custom symbols?",
+    html:
+      `<p>MT5 reported <strong>no</strong> matching custom symbols, but ` +
+      `<strong>${res.symbols.length}</strong> cached row(s) were kept. ` +
+      `Clear them (use this only if you deleted every custom symbol in MT5)?</p>`,
+    confirmText: "Clear cache",
+  });
 }
 
 async function refreshCustomSymbolsFromMt5() {
@@ -1024,11 +1069,29 @@ async function refreshCustomSymbolsFromMt5() {
   statusEl.textContent = "Launching MetaTrader 5 to read custom symbols…";
   tableEl.innerHTML = '<p class="empty">Loading…</p>';
   try {
-    const { symbols } = await api("/api/mt5/custom-symbols/refresh", { method: "POST" });
-    statusEl.textContent = symbols.length
-      ? `${symbols.length} symbol(s) synced from MT5`
-      : "No matching custom symbols found in MT5";
-    renderCustomSymbolsTable(symbols || []);
+    const res = await api("/api/mt5/custom-symbols/refresh", { method: "POST" });
+    const confirmed = await maybeConfirmEmptyPrune(res);
+    const finalRes = confirmed
+      ? await api("/api/mt5/custom-symbols/refresh", {
+          method: "POST",
+          body: JSON.stringify({ prune_empty: true, skip_relist: true }),
+        })
+      : res;
+    const symbols = finalRes.symbols || [];
+    const removed = finalRes.removed || [];
+    const last = lastSyncedAt(symbols);
+    let msg;
+    if (!symbols.length && confirmed) {
+      msg = finalRes.pruned_empty ? "Cached custom symbols cleared." : "Cache unchanged.";
+    } else {
+      msg = symbols.length
+        ? `${symbols.length} symbol(s) synced from MT5${last ? ` · last synced ${fmtSyncTime(last)}` : ""}`
+        : "No matching custom symbols found in MT5 — check suffix/group filter and queried terminal";
+    }
+    if (removed.length) msg += ` · removed stale: ${removed.join(", ")}`;
+    if (finalRes.warning) msg += ` · WARNING: ${finalRes.warning}`;
+    statusEl.textContent = msg;
+    renderCustomSymbolsTable(symbols);
   } catch (e) {
     statusEl.textContent = "";
     tableEl.innerHTML = `<p class="empty">${e.message}</p>`;

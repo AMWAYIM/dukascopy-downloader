@@ -16,7 +16,14 @@ from core.exceptions import IncompleteDatasetError
 from core.services.gap_scanner import GapScanner, require_complete_import
 from core.services.instrument_search import UnknownInstrumentError
 from core.services.jetta_metadata import fetch_instrument_info
-from export.mt5_importer import Mt5Settings, kill_mt5_terminal, wait_mt5_exit
+from export.mt5_importer import (
+    Mt5Settings,
+    diagnose_mt5,
+    kill_mt5_terminal,
+    list_terminal_processes,
+    normalize_suffix,
+    wait_mt5_exit,
+)
 from export.mt5_symbol_manager import delete_custom_symbol, list_custom_symbols
 from storage.fast_delete import release_import_staging_locks
 from storage.metadata_db import MetadataDB
@@ -95,6 +102,16 @@ class Mt5ImportRequest(BaseModel):
     start: str | None = None
     end: str | None = None
     import_all: bool = False
+
+
+class Mt5RefreshRequest(BaseModel):
+    # MT5 reported zero symbols: only clear the cache when explicitly
+    # confirmed (a wrong suffix/filter would otherwise wipe history).
+    prune_empty: bool = False
+    # Skip the minutes-long MT5 relist for a pure cache clear. Only valid
+    # with prune_empty: the caller must have verified MT5 is empty via a
+    # prior refresh moments earlier.
+    skip_relist: bool = False
 
 
 class GapsRequest(BaseModel):
@@ -559,8 +576,6 @@ def api_list_mt5_custom_symbols() -> dict[str, Any]:
 
 @app.get("/api/mt5/diagnostics")
 def api_mt5_diagnostics() -> dict[str, Any]:
-    from export.mt5_importer import diagnose_mt5, list_terminal_processes
-
     mt5_config = settings_store().get_mt5()
     diag = diagnose_mt5(mt5_config)
     diag["running_terminals"] = list_terminal_processes()
@@ -577,7 +592,7 @@ def _guess_source_symbol(custom_name: str, suffix: str) -> str:
 
 
 @app.post("/api/mt5/custom-symbols/refresh")
-def api_refresh_mt5_custom_symbols() -> dict[str, Any]:
+def api_refresh_mt5_custom_symbols(body: Mt5RefreshRequest | None = None) -> dict[str, Any]:
     if jobs.has_active_mt5_import():
         raise HTTPException(409, "Wait for the running MT5 import to finish before refreshing")
 
@@ -588,22 +603,70 @@ def api_refresh_mt5_custom_symbols() -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
-    suffix = str(mt5_config.get("custom_suffix") or ".DUK").strip() or ".DUK"
-    try:
-        symbols = list_custom_symbols(mt5_config, settings().data_dir)
-    except Exception as exc:
-        raise HTTPException(500, str(exc)) from exc
+    suffix = normalize_suffix(mt5_config.get("custom_suffix"))
+    prune_empty = bool(body.prune_empty) if body else False
+    skip_relist = bool(body.skip_relist) if body else False
+    if skip_relist and not prune_empty:
+        raise HTTPException(400, "skip_relist requires prune_empty=true")
+    if skip_relist:
+        logger.info("MT5 custom symbols clear: skipping MT5 relist (caller-verified empty)")
+        symbols: list[dict[str, Any]] = []
+    else:
+        try:
+            symbols = list_custom_symbols(mt5_config, settings().data_dir)
+        except Exception as exc:
+            raise HTTPException(500, str(exc)) from exc
 
+    # Authoritative sync: only called after a successful live MT5 read,
+    # so stale DB rows (deleted in MT5) are pruned here.
     metadata = db()
+    entries: list[dict[str, Any]] = []
     for entry in symbols:
-        metadata.upsert_mt5_custom_symbol(
-            symbol=str(entry["symbol"]),
-            source_symbol=_guess_source_symbol(str(entry["symbol"]), suffix),
-            ticks=int(entry.get("ticks", 0)),
-            first_ms=int(entry.get("first_ms", 0)),
-            last_ms=int(entry.get("last_ms", 0)),
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("symbol", "")).strip()
+        if not name:
+            continue
+        entries.append({
+            "symbol": name,
+            "source_symbol": _guess_source_symbol(name, suffix),
+            "ticks": int(entry.get("ticks", 0) or 0),
+            "first_ms": int(entry.get("first_ms", 0) or 0),
+            "last_ms": int(entry.get("last_ms", 0) or 0),
+        })
+    removed, pruned = metadata.sync_mt5_custom_symbols(entries, prune_empty=prune_empty)
+    live = [e["symbol"] for e in entries]
+    logger.info(
+        "MT5 custom symbols synced: %d live (%s), pruned %d (%s)",
+        len(entries), live, len(removed), removed,
+    )
+
+    diag = diagnose_mt5(mt5_config)
+    running = list_terminal_processes()
+    warnings: list[str] = []
+    if len(running) > 1:
+        warnings.append(
+            f"{len(running)} MT5 terminals running — refresh queried "
+            f"{diag.get('terminal_exe')}; close the others or set terminal64.exe explicitly.",
         )
-    return {"symbols": metadata.list_mt5_custom_symbols()}
+    cached = metadata.list_mt5_custom_symbols()
+    pruned_empty = not entries and pruned
+    if not entries and not pruned and cached:
+        warnings.append(
+            f"MT5 reported 0 symbols — {len(cached)} cached row(s) left untouched; "
+            "check the suffix/group filter, or confirm clearing to drop them.",
+        )
+    return {
+        "symbols": cached,
+        "removed": removed,
+        "live_count": len(entries),
+        "pruned_empty": pruned_empty,
+        "suffix": suffix,
+        "terminal_exe": diag.get("terminal_exe"),
+        "mode": diag.get("mode"),
+        "running_terminals": running,
+        "warning": " · ".join(warnings) if warnings else None,
+    }
 
 
 @app.delete("/api/mt5/custom-symbols/{symbol}")

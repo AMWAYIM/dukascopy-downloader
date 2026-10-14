@@ -39,7 +39,7 @@ LEGACY_MANAGER_NAMES = (
     "DukascopySymbolManager.ex5",
 )
 JOB_ROOT = "dukascopy_jobs"
-EXPECTED_SCRIPT_VERSION = "1.21"
+EXPECTED_SCRIPT_VERSION = "1.23"
 
 _import_lock = threading.Lock()
 _active_terminal: dict[str, Path] = {}
@@ -71,9 +71,7 @@ class Mt5Settings:
         data_path_raw = str(raw.get("data_path") or "").strip()
         if data_path_raw and not Path(data_path_raw).is_dir():
             raise ValueError(f"MT5 data folder not found: {Path(data_path_raw)}")
-        suffix = str(raw.get("custom_suffix") or ".DUK").strip() or ".DUK"
-        if not suffix.startswith("."):
-            suffix = "." + suffix
+        suffix = normalize_suffix(raw.get("custom_suffix"))
         if len(suffix) > 30:
             raise ValueError(f"Custom suffix '{suffix}' is too long")
 
@@ -99,15 +97,21 @@ class Mt5Settings:
         if not data_path.is_dir():
             raise ValueError(f"MT5 data folder not found: {data_path}")
 
-        suffix = str(raw.get("custom_suffix") or ".DUK").strip() or ".DUK"
-        if not suffix.startswith("."):
-            suffix = "." + suffix
+        suffix = normalize_suffix(raw.get("custom_suffix"))
         return cls(
             terminal_exe=terminal_exe,
             data_path=data_path,
             custom_suffix=suffix,
             portable=portable,
         )
+
+
+def normalize_suffix(raw: Any, default: str = ".DUK") -> str:
+    """Normalize a custom-symbol suffix to leading-dot form (``DUK`` → ``.DUK``)."""
+    suffix = str(raw or default).strip() or default
+    if not suffix.startswith("."):
+        suffix = "." + suffix
+    return suffix
 
 
 def _parse_portable(value: Any) -> bool:

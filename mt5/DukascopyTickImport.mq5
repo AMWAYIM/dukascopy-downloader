@@ -4,7 +4,7 @@
 //| Launched via [StartUp] Script= in import.ini (live terminal).     |
 //+------------------------------------------------------------------+
 #property copyright "Dukascopy Downloader"
-#property version   "1.21"
+#property version   "1.23"
 #property strict
 #property script_show_inputs
 
@@ -177,7 +177,7 @@ bool WriteProgressThrottled(const string state, const string phase, const long t
                    + "message=" + message + "\n"
                    + "error_code=" + IntegerToString(errorCode) + "\n"
                    + filesLine
-                   + "script_version=1.21\n";
+                   + "script_version=1.23\n";
    for(int attempt = 0; attempt < 20; attempt++)
      {
       // Quiet while terminal retries are pending: a persistently locked
@@ -682,9 +682,17 @@ bool MatchesFilter(const string symbol, const string customPath, const string su
       return true;
 
    string path = SymbolInfoString(symbol, SYMBOL_PATH);
+// MT5 reports group paths like "Custom\dukascopy", not bare "dukascopy",
+// and users may move symbols between groups manually. Match a whole path
+// segment (not a raw substring) so unrelated groups such as "mydukascopy"
+// are still excluded while "Custom\dukascopy\sub" is included.
    if(path == customPath)
       return true;
-   if(StringFind(path, customPath) == 0)
+   if(StringFind(path, customPath + "\\") == 0)
+      return true;
+   if(StringFind(path, "\\" + customPath + "\\") >= 0)
+      return true;
+   if(EndsWith(path, "\\" + customPath))
       return true;
    return false;
   }
@@ -715,9 +723,11 @@ bool ListCustomSymbols(const string customPath, const string suffix)
       if(ticks > 0)
          GetSymbolTickSpan(sym, firstMsc, lastMsc);
 
+      string symPath = SymbolInfoString(sym, SYMBOL_PATH);
       string outLine = sym + "|" + IntegerToString(ticks)
                       + "|" + IntegerToString(firstMsc)
-                      + "|" + IntegerToString(lastMsc) + "\n";
+                      + "|" + IntegerToString(lastMsc)
+                      + "|" + symPath + "\n";
       if(outC != INVALID_HANDLE)
          FileWriteString(outC, outLine);
       if(outL != INVALID_HANDLE)
@@ -967,7 +977,7 @@ void OnStart()
       return;
      }
 
-   JobLog("OnStart v1.21 JobId=" + JobId + " chart=" + _Symbol);
+   JobLog("OnStart v1.23 JobId=" + JobId + " chart=" + _Symbol);
 
    string action = ManifestValue("action");
    if(action == "list")

@@ -22,6 +22,7 @@ from export.mt5_importer import (
     job_dir_for,
     kill_mt5_terminal,
     launch_mt5_background,
+    normalize_suffix,
     parse_progress_file,
     parse_progress_file_any,
     wait_mt5_exit,
@@ -54,6 +55,7 @@ class CustomSymbolInfo:
     ticks: int
     first_ms: int
     last_ms: int
+    symbol_path: str = ""
 
     @property
     def first_utc(self) -> str | None:
@@ -79,6 +81,7 @@ class CustomSymbolInfo:
             "last_ms": self.last_ms,
             "first_utc": self.first_utc,
             "last_utc": self.last_utc,
+            "symbol_path": self.symbol_path,
         }
 
 
@@ -132,6 +135,7 @@ def _parse_symbols_file(path: Path) -> list[CustomSymbolInfo]:
                 ticks=int(parts[1]),
                 first_ms=int(parts[2]),
                 last_ms=int(parts[3]),
+                symbol_path=parts[4] if len(parts) > 4 else "",
             ))
         except ValueError:
             continue
@@ -239,9 +243,7 @@ def _run_symbol_job(
 
 def list_custom_symbols(mt5_raw: dict[str, Any], settings_data_dir: Path) -> list[dict[str, Any]]:
     job_id = str(uuid.uuid4())
-    suffix = str(mt5_raw.get("custom_suffix") or ".DUK").strip() or ".DUK"
-    if not suffix.startswith("."):
-        suffix = "." + suffix
+    suffix = normalize_suffix(mt5_raw.get("custom_suffix"))
 
     manifest = {
         "job_id": job_id,
@@ -256,7 +258,12 @@ def list_custom_symbols(mt5_raw: dict[str, Any], settings_data_dir: Path) -> lis
         for job_dir in job_dirs:
             symbols_file = job_dir / "symbols.txt"
             if symbols_file.is_file():
-                return [s.to_dict() for s in _parse_symbols_file(symbols_file)]
+                parsed = [s.to_dict() for s in _parse_symbols_file(symbols_file)]
+                logger.info(
+                    "MT5 list: %d symbol(s) suffix=%s custom_path=dukascopy: %s",
+                    len(parsed), suffix, [s["symbol"] for s in parsed],
+                )
+                return parsed
         if not job_dirs:
             raise Mt5JobError("MT5 list job produced no symbols.txt (no job folder available)")
         raise Mt5JobError(

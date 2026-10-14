@@ -360,6 +360,67 @@ class MetadataDB:
             ).fetchall()
         return [self._mt5_symbol_row(r) for r in rows]
 
+    @staticmethod
+    def _norm_mt5_symbol(entry: dict) -> str:
+        return str(entry.get("symbol", "")).strip()
+
+    def _write_mt5_symbol_row(
+        self,
+        *,
+        symbol: str,
+        source_symbol: str,
+        ticks: int,
+        first_ms: int,
+        last_ms: int,
+        range_label: str | None,
+        imported_at: str | None,
+        synced_at: str,
+    ) -> None:
+        """Single-row upsert; caller must hold the lock. Preserves import history."""
+        self._conn.execute(
+            """
+            INSERT INTO mt5_custom_symbol (
+                symbol, source_symbol, ticks, first_ms, last_ms,
+                range_label, imported_at, synced_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET
+                source_symbol=excluded.source_symbol,
+                ticks=excluded.ticks,
+                first_ms=excluded.first_ms,
+                last_ms=excluded.last_ms,
+                range_label=COALESCE(excluded.range_label, mt5_custom_symbol.range_label),
+                imported_at=COALESCE(excluded.imported_at, mt5_custom_symbol.imported_at),
+                synced_at=excluded.synced_at
+            """,
+            (
+                symbol,
+                source_symbol,
+                ticks,
+                first_ms,
+                last_ms,
+                range_label,
+                imported_at,
+                synced_at,
+            ),
+        )
+
+    def _commit_mt5_write(self) -> None:
+        # Custom-symbol writes are rare, explicit user actions: commit at
+        # once so the result survives a restart. This differs from the
+        # hour-ledger hot path, which batches via _uncommitted/_commit_every;
+        # the commit below also persists any batched hour rows, which is
+        # harmless (they are complete statements), and resets the counter.
+        self._conn.commit()
+        self._uncommitted = 0
+        # Fold the WAL into the main db file so the write survives even if
+        # the -wal/-shm sidecars are lost across a restart (cloud-synced
+        # folders, hard kills, file copies). Degrades gracefully under
+        # cross-process read locks: PRAGMA reports busy instead of raising.
+        try:
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
+
     def upsert_mt5_custom_symbol(
         self,
         *,
@@ -380,33 +441,17 @@ class MetadataDB:
                     (symbol,),
                 ).fetchone()
                 imported_at = now if mark_imported else (existing[0] if existing else None)
-                self._conn.execute(
-                    """
-                    INSERT INTO mt5_custom_symbol (
-                        symbol, source_symbol, ticks, first_ms, last_ms,
-                        range_label, imported_at, synced_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(symbol) DO UPDATE SET
-                        source_symbol=excluded.source_symbol,
-                        ticks=excluded.ticks,
-                        first_ms=excluded.first_ms,
-                        last_ms=excluded.last_ms,
-                        range_label=COALESCE(excluded.range_label, mt5_custom_symbol.range_label),
-                        imported_at=COALESCE(excluded.imported_at, mt5_custom_symbol.imported_at),
-                        synced_at=excluded.synced_at
-                    """,
-                    (
-                        symbol,
-                        source_symbol,
-                        ticks,
-                        first_ms,
-                        last_ms,
-                        range_label,
-                        imported_at,
-                        now,
-                    ),
+                self._write_mt5_symbol_row(
+                    symbol=symbol,
+                    source_symbol=source_symbol,
+                    ticks=ticks,
+                    first_ms=first_ms,
+                    last_ms=last_ms,
+                    range_label=range_label,
+                    imported_at=imported_at,
+                    synced_at=now,
                 )
-                self._uncommitted += 1
+                self._commit_mt5_write()
 
         self._with_locked_retry(_do_upsert)
 
@@ -414,6 +459,67 @@ class MetadataDB:
         def _do_delete() -> None:
             with self._lock:
                 self._conn.execute("DELETE FROM mt5_custom_symbol WHERE symbol=?", (symbol,))
-                self._uncommitted += 1
+                self._commit_mt5_write()
 
         self._with_locked_retry(_do_delete)
+
+    def sync_mt5_custom_symbols(
+        self,
+        entries: list[dict],
+        *,
+        prune_empty: bool = False,
+    ) -> tuple[list[str], bool]:
+        """Authoritative sync: upsert fresh entries, delete stale rows.
+
+        Only call after a *successful* live read from MT5. Returns
+        ``(removed, pruned)`` where ``pruned`` tells whether the delete
+        pass ran. When MT5 reports zero symbols and ``prune_empty`` is
+        False, the prune is skipped (cache left untouched) so a wrong
+        suffix/filter cannot wipe import history; pass
+        ``prune_empty=True`` only after explicit user confirmation.
+        """
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        removed: list[str] = []
+        pruned = False
+
+        def _do_sync() -> None:
+            nonlocal removed, pruned
+            with self._lock:
+                fresh = {
+                    self._norm_mt5_symbol(e) for e in entries
+                    if self._norm_mt5_symbol(e)
+                }
+                for entry in entries:
+                    symbol = self._norm_mt5_symbol(entry)
+                    if not symbol:
+                        continue
+                    existing = self._conn.execute(
+                        "SELECT imported_at FROM mt5_custom_symbol WHERE symbol=?",
+                        (symbol,),
+                    ).fetchone()
+                    self._write_mt5_symbol_row(
+                        symbol=symbol,
+                        source_symbol=str(entry.get("source_symbol", "")),
+                        ticks=int(entry.get("ticks", 0) or 0),
+                        first_ms=int(entry.get("first_ms", 0) or 0),
+                        last_ms=int(entry.get("last_ms", 0) or 0),
+                        range_label=entry.get("range_label"),
+                        imported_at=existing[0] if existing else None,
+                        synced_at=now,
+                    )
+                rows = self._conn.execute("SELECT symbol FROM mt5_custom_symbol").fetchall()
+                if not fresh and rows and not prune_empty:
+                    # Read-only path: nothing was written above, so there is
+                    # nothing to commit or checkpoint.
+                    removed = []
+                    pruned = False
+                    return
+                stale = [r[0] for r in rows if r[0] not in fresh]
+                for symbol in stale:
+                    self._conn.execute("DELETE FROM mt5_custom_symbol WHERE symbol=?", (symbol,))
+                self._commit_mt5_write()
+                removed = sorted(stale)
+                pruned = True
+
+        self._with_locked_retry(_do_sync)
+        return removed, pruned
