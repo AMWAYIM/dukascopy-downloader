@@ -1482,11 +1482,14 @@ function dirName(pathStr) {
   return idx === -1 ? "" : s.slice(0, idx);
 }
 
-function setPickerUnavailable() {
+function setPickerUnavailable(msg) {
   state.pickerAvailable = false;
   document.querySelectorAll(".js-browse").forEach((b) => b.classList.add("hidden"));
   const hint = $("#browse-unavailable");
-  if (hint) hint.classList.remove("hidden");
+  if (hint) {
+    hint.textContent = msg || "Browse is unavailable — open the app from this machine to pick paths.";
+    hint.classList.remove("hidden");
+  }
 }
 
 async function browseForPath(target) {
@@ -1504,7 +1507,7 @@ async function browseForPath(target) {
       body: JSON.stringify({ mode, initial_dir: initial || null }),
     });
   } catch (e) {
-    setPickerUnavailable();
+    setPickerUnavailable(e.message);
     toastError(e.message);
     return;
   }

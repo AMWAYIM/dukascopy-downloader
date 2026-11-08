@@ -7,6 +7,7 @@ returning the chosen absolute path. Used by the Settings Browse… buttons.
 """
 from __future__ import annotations
 
+import ctypes
 import os
 import shutil
 import subprocess
@@ -15,6 +16,7 @@ from subprocess import TimeoutExpired as _TimeoutExpired
 from typing import Literal
 
 _CANCELLED = "__CANCELLED__"
+_PICKER_TIMEOUT = 60.0
 
 _PS_SCRIPT = r"""
 $mode = $env:DUKE_PICKER_MODE
@@ -53,18 +55,42 @@ def _find_powershell() -> str:
     raise RuntimeError("PowerShell not found on this machine")
 
 
+def has_interactive_desktop() -> bool:
+    """True when the current session can show a visible dialog.
+
+    Uses OpenInputDesktop: in a non-interactive session (service, scheduled
+    task, SSH) there is no input desktop and a dialog would hang invisibly.
+    Fail-open: if the check itself cannot run, assume interactive.
+    """
+    try:
+        user32 = ctypes.windll.user32
+        # DESKTOP_SWITCHDESKTOP = 0x0100
+        desktop = user32.OpenInputDesktop(0, False, 0x0100)
+        if not desktop:
+            return False
+        user32.CloseDesktop(desktop)
+        return True
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def show_path_picker(
     mode: Literal["file", "folder"],
     initial_dir: Path | str | None = None,
-    timeout: float = 120.0,
+    timeout: float = _PICKER_TIMEOUT,
 ) -> Path | None:
     """Present a native dialog; return the picked path or None on cancel.
 
     Raises RuntimeError when PowerShell is missing, the dialog process fails,
-    or the dialog times out.
+    the session is non-interactive, or the dialog times out.
     """
     if mode not in ("file", "folder"):
         raise ValueError(f"mode must be 'file' or 'folder', got: {mode}")
+    if not has_interactive_desktop():
+        raise RuntimeError(
+            "no interactive desktop available - run the app from your desktop "
+            "session (not a service/SSH/scheduled task)"
+        )
 
     env = os.environ.copy()
     env["DUKE_PICKER_MODE"] = mode
@@ -74,7 +100,8 @@ def show_path_picker(
     cmd = [
         _find_powershell(),
         "-NoProfile",
-        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
         "-STA",
         "-Command",
         _PS_SCRIPT,
@@ -90,7 +117,10 @@ def show_path_picker(
             creationflags=creationflags,
         )
     except _TimeoutExpired as exc:
-        raise RuntimeError("native picker timed out") from exc
+        raise RuntimeError(
+            f"native picker timed out after {int(timeout)}s - "
+            "is the app running on an interactive desktop?"
+        ) from exc
     except OSError as exc:
         raise RuntimeError(f"failed to launch native picker: {exc}") from exc
 

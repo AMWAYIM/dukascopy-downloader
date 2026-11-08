@@ -1,6 +1,7 @@
 """FastAPI web UI for the Dukascopy downloader."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -44,7 +45,7 @@ from web.jobs import (
     run_gaps_job,
     run_mt5_import_job,
 )
-from web.path_picker import show_path_picker
+from web.path_picker import has_interactive_desktop, show_path_picker
 from web.scheduler import get_scheduler, init_scheduler
 from web.settings_store import settings_store
 
@@ -835,9 +836,16 @@ async def pick_path(body: PathPickRequest, request: Request) -> dict[str, Any]:
     client_host = request.client.host if request.client else None
     if not _is_loopback_host(client_host):
         raise HTTPException(403, "browse is only available from this machine")
+    if not has_interactive_desktop():
+        raise HTTPException(
+            409,
+            "cannot show a native dialog in this session - run the app from "
+            "your desktop (not a service/SSH/scheduled task)",
+        )
     initial = Path(body.initial_dir).expanduser() if body.initial_dir else None
+    loop = asyncio.get_running_loop()
     try:
-        picked = show_path_picker(body.mode, initial)
+        picked = await loop.run_in_executor(None, show_path_picker, body.mode, initial)
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(500, f"native picker failed: {exc}") from exc
     return {"path": str(picked) if picked else None}

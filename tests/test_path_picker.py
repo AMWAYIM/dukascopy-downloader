@@ -6,6 +6,7 @@ runner and simulating loopback/remote clients.
 """
 from __future__ import annotations
 
+import ctypes
 import subprocess
 import unittest
 from pathlib import Path
@@ -29,6 +30,11 @@ def _fake_proc(stdout: str, returncode: int = 0, stderr: str = "") -> subprocess
 
 
 class PathPickerRunnerTests(unittest.TestCase):
+    def setUp(self):
+        self._interactive = mock.patch.object(picker_module, "has_interactive_desktop", return_value=True)
+        self._interactive.start()
+        self.addCleanup(self._interactive.stop)
+
     def test_folder_mode_returns_path(self):
         picked = Path(r"D:\Trading\MT5\TickData")
         with mock.patch.object(picker_module, "subprocess") as mock_sp:
@@ -72,8 +78,30 @@ class PathPickerRunnerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             picker_module.show_path_picker("weird")  # type: ignore[arg-type]
 
+    def test_non_interactive_session_raises(self):
+        with mock.patch.object(picker_module, "has_interactive_desktop", return_value=False):
+            with self.assertRaises(RuntimeError):
+                picker_module.show_path_picker("folder")
+
+
+class InteractiveDesktopDetectionTests(unittest.TestCase):
+    def test_detects_no_desktop(self):
+        with mock.patch.object(ctypes, "windll") as mock_windll:
+            mock_windll.user32.OpenInputDesktop.return_value = 0
+            self.assertFalse(picker_module.has_interactive_desktop())
+
+    def test_true_when_desktop_present(self):
+        with mock.patch.object(ctypes, "windll") as mock_windll:
+            mock_windll.user32.OpenInputDesktop.return_value = 12345
+            self.assertTrue(picker_module.has_interactive_desktop())
+
 
 class PathPickEndpointTests(unittest.TestCase):
+    def setUp(self):
+        self._interactive = mock.patch.object(app_module, "has_interactive_desktop", return_value=True)
+        self._interactive.start()
+        self.addCleanup(self._interactive.stop)
+
     def _request(self, host: str):
         return SimpleNamespace(client=SimpleNamespace(host=host))
 
@@ -116,6 +144,15 @@ class PathPickEndpointTests(unittest.TestCase):
                 asyncio.run(pick_path(PathPickRequest(mode="folder"), self._request("127.0.0.1")))
         self.assertEqual(ctx.exception.status_code, 500)
         self.assertIn("picker", str(ctx.exception.detail).lower())
+
+    def test_non_interactive_session_returns_409(self):
+        import asyncio
+        with mock.patch.object(app_module, "has_interactive_desktop", return_value=False), \
+             mock.patch.object(app_module, "show_path_picker") as mock_pick:
+            with self.assertRaises(HTTPException) as ctx:
+                asyncio.run(pick_path(PathPickRequest(mode="folder"), self._request("127.0.0.1")))
+        self.assertEqual(ctx.exception.status_code, 409)
+        mock_pick.assert_not_called()
 
 
 if __name__ == "__main__":
