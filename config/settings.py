@@ -4,14 +4,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from config.data_config import effective_data_dir, validate_data_dir
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
 @dataclass
 class Settings:
     # Paths
-    data_dir: Path = field(default_factory=lambda: BASE_DIR / "data")
-    db_path: Path = field(default_factory=lambda: BASE_DIR / "data" / "metadata.db")
+    data_dir: Path = field(default_factory=lambda: effective_data_dir()[0])
     instruments_file: Path = field(default_factory=lambda: BASE_DIR / "config" / "instruments.json")
 
     # Dukascopy JETTA API (JSON ticks, not rate-limited like the legacy datafeed)
@@ -39,8 +40,13 @@ class Settings:
     # The most recent hours may not yet be published.
     min_data_lag_hours: int = 2
 
+    @property
+    def db_path(self) -> Path:
+        """SQLite ledger lives inside the data root — never split from the ticks."""
+        return self.data_dir / "metadata.db"
+
     def ensure_directories(self) -> None:
-        self.data_dir.mkdir(parents=True, exist_ok=True)
+        validate_data_dir(self.data_dir)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
     def for_job(self, workers: int | None = None) -> Settings:

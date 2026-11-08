@@ -696,7 +696,11 @@ def main(argv: list[str] | None = None) -> int:
 
     args = _build_parser().parse_args(argv)
     settings = Settings()
-    settings.ensure_directories()
+    try:
+        settings.ensure_directories()
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     catalog = InstrumentCatalog(settings.instruments_file)
 
     try:
