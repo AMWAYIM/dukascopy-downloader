@@ -15,7 +15,7 @@ from unittest import mock
 
 from web import app as app_module
 from web.app import DataMigrationRequest, DataSettingsUpdate
-from web.app import patch_data_settings, start_data_migration, get_settings
+from web.app import patch_data_settings, start_data_migration, get_settings, clear_data_settings
 
 
 def _run(coro):
@@ -87,6 +87,15 @@ class DataSettingsEndpointTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as ctx:
             _run(patch_data_settings(DataSettingsUpdate(dir="  ")))
         self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_delete_data_settings_clears_config(self):
+        with mock.patch.object(app_module, "clear_configured_data_dir") as mock_clear, \
+             mock.patch.object(app_module, "effective_data_dir", return_value=(self._tmp_path / "data", "default")), \
+             mock.patch.object(app_module, "load_configured_data_dir", return_value=None):
+            res = _run(clear_data_settings())
+        mock_clear.assert_called_once_with()
+        self.assertEqual(res["data"]["source"], "default")
+        self.assertFalse(res["data"]["restart_required"])
 
 
 class DataMigrationEndpointTests(unittest.TestCase):

@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from core.exceptions import IncompleteDatasetError
 from config.data_config import (
+    clear_configured_data_dir,
     effective_data_dir,
     load_configured_data_dir,
     save_configured_data_dir,
@@ -786,6 +787,12 @@ async def patch_data_settings(body: DataSettingsUpdate) -> dict[str, Any]:
         save_configured_data_dir(target)
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(400, str(exc)) from exc
+    return {"data": _data_settings_payload()}
+
+
+@app.delete("/api/settings/data")
+async def clear_data_settings() -> dict[str, Any]:
+    clear_configured_data_dir()
     return {"data": _data_settings_payload()}
 
 

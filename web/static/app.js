@@ -1389,6 +1389,8 @@ async function loadSettings() {
     }
     const banner = $("#data-restart-banner");
     if (banner) banner.classList.toggle("hidden", !dataSettings.restart_required);
+    const defaultBtn = $("#set-data-default");
+    if (defaultBtn) defaultBtn.disabled = dataSettings.source === "default";
   } catch (e) {
     $("#auto-list").innerHTML = `<p class="empty">${e.message}</p>`;
   }
@@ -1457,6 +1459,16 @@ $("#start-migrate-btn")?.addEventListener("click", async () => {
     toastSuccess("Migration started — watch the Jobs tab");
     switchTab("jobs", { save: false });
     refreshJobs();
+  } catch (e) {
+    toastError(e.message);
+  }
+});
+
+$("#set-data-default")?.addEventListener("click", async () => {
+  try {
+    await api("/api/settings/data", { method: "DELETE" });
+    toastSuccess("Back to the default data root — restart to apply");
+    await loadSettings();
   } catch (e) {
     toastError(e.message);
   }
