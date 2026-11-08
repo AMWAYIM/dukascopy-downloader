@@ -436,6 +436,10 @@ Write-InstalledManifest -PythonExe $pythonExe -Mt5Configured $mt5Configured
 Write-Host ''
 Write-Host 'Setup complete.' -ForegroundColor Green
 Write-Host 'Start the app:     run.bat' -ForegroundColor White
+$configureNow = Read-Host 'Configure data folders now (Browse/Auto-detect)? [y/N]'
+if ($configureNow -match '^(y|yes)$') {
+  & (Join-Path $RepoRoot 'installer\configure-paths.ps1') -PythonExe $pythonExe
+}
 Write-Host 'Open in browser:   http://127.0.0.1:8080' -ForegroundColor White
 Write-Host 'Compile script:  MetaEditor -> mt5/DukascopyTickImport.mq5 -> Compile' -ForegroundColor White
 Write-Host ''
