@@ -4,11 +4,17 @@ The web UI runs in a browser, which cannot open native file/folder dialogs.
 This module shells out to PowerShell on the machine running the server and
 presents a modern native dialog (COM ``IFileOpenDialog``, Vista style),
 falling back to the classic WinForms dialogs if COM interop is unavailable.
-Only one picker may be open at a time (see ``is_picker_busy``).
+
+To avoid the per-request PowerShell cold start and C# recompilation
+(``Add-Type``) that made Browse feel slow, a persistent worker process stays
+alive after its first use and serves every later dialog. The one-shot path
+remains as a fallback if the worker fails. Only one picker may be open at a
+time (see ``is_picker_busy``).
 """
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import shutil
 import subprocess
@@ -21,6 +27,7 @@ _CANCELLED = "__CANCELLED__"
 _PICKER_TIMEOUT = 45.0
 
 _picker_lock = threading.Lock()
+_worker_proc: subprocess.Popen | None = None
 
 
 def is_picker_busy() -> bool:
@@ -28,11 +35,7 @@ def is_picker_busy() -> bool:
     return _picker_lock.locked()
 
 
-_PS_SCRIPT = r"""
-$mode = $env:DUKE_PICKER_MODE
-$initial = $env:DUKE_PICKER_INITIAL
-
-$src = @'
+_CORE_CSHARP = r"""
 using System;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -179,14 +182,19 @@ namespace DukePicker
         }
     }
 }
-'@
+"""
 
+_ONE_SHOT_SCRIPT = r"""
+$mode = $env:DUKE_PICKER_MODE
+$initial = $env:DUKE_PICKER_INITIAL
+$src = @'
+__CSHARP__
+'@
 try {
     Add-Type -TypeDefinition $src
     $out = [DukePicker.Native]::PickFolderOrFile($mode -eq 'folder', $initial)
     if ($null -eq $out) { Write-Output '__CANCELLED__' } else { Write-Output $out }
 } catch {
-    # Fallback to the classic dialogs when COM interop is unavailable.
     Add-Type -AssemblyName System.Windows.Forms | Out-Null
     if ($mode -eq 'file') {
         $d = New-Object System.Windows.Forms.OpenFileDialog
@@ -203,7 +211,36 @@ try {
         else { Write-Output '__CANCELLED__' }
     }
 }
-"""
+""".replace("__CSHARP__", _CORE_CSHARP)
+
+_WORKER_SCRIPT = r"""
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+[Console]::InputEncoding = [System.Text.Encoding]::UTF8
+$src = @'
+__CSHARP__
+'@
+Add-Type -TypeDefinition $src | Out-Null
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    if (-not $line.Trim()) { continue }
+    try {
+        $req = $line | ConvertFrom-Json
+        $mode = [string]$req.mode
+        $initial = [string]$req.initial
+        $out = [DukePicker.Native]::PickFolderOrFile($mode -eq 'folder', $initial)
+        if ($null -eq $out) {
+            Write-Output '{"path":null}'
+        } else {
+            $escaped = $out.Replace('\', '\\').Replace('"', '\"')
+            Write-Output ('{"path":"' + $escaped + '"}')
+        }
+    } catch {
+        $msg = $_.Exception.Message.Replace('\', '\\').Replace('"', '\"')
+        Write-Output ('{"error":"' + $msg + '"}')
+    }
+}
+""".replace("__CSHARP__", _CORE_CSHARP)
 
 
 def _find_powershell() -> str:
@@ -235,6 +272,98 @@ def has_interactive_desktop() -> bool:
         return True
 
 
+def _spawn_worker() -> subprocess.Popen:
+    global _worker_proc
+    cmd = [
+        _find_powershell(),
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-STA",
+        "-Command",
+        _WORKER_SCRIPT,
+    ]
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    _worker_proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=creationflags,
+    )
+    return _worker_proc
+
+
+def _pick_via_worker(mode: str, initial_dir: str) -> Path | None:
+    """Use the persistent warm PowerShell worker (fast path)."""
+    proc = _worker_proc
+    if proc is None or proc.poll() is not None:
+        proc = _spawn_worker()
+    payload = json.dumps({"mode": mode, "initial": initial_dir}) + "\n"
+    proc.stdin.write(payload)  # type: ignore[union-attr]
+    proc.stdin.flush()  # type: ignore[union-attr]
+    line = proc.stdout.readline()  # type: ignore[union-attr]
+    if not line.strip():
+        raise RuntimeError("picker worker exited unexpectedly")
+    try:
+        data = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"picker worker returned invalid output: {line.strip()}") from exc
+    if "error" in data:
+        raise RuntimeError(data["error"])
+    path = data.get("path")
+    return Path(path) if path else None
+
+
+def _pick_oneshot(mode: str, initial_dir: Path | None, timeout: float = _PICKER_TIMEOUT) -> Path | None:
+    """One-shot subprocess dialog (fallback path, slower)."""
+    env = os.environ.copy()
+    env["DUKE_PICKER_MODE"] = mode
+    env["DUKE_PICKER_INITIAL"] = str(initial_dir) if initial_dir and initial_dir.is_dir() else ""
+
+    cmd = [
+        _find_powershell(),
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-STA",
+        "-Command",
+        _ONE_SHOT_SCRIPT,
+    ]
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        proc = subprocess.run(
+            cmd,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            creationflags=creationflags,
+        )
+    except _TimeoutExpired as exc:
+        raise RuntimeError(
+            f"native picker timed out after {int(timeout)}s - "
+            "is the app running on an interactive desktop?"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(f"failed to launch native picker: {exc}") from exc
+
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or f"exit code {proc.returncode}"
+        raise RuntimeError(f"native picker failed: {detail}")
+
+    lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+    result = lines[-1] if lines else ""
+    if result == _CANCELLED:
+        return None
+    if not result:
+        raise RuntimeError("native picker produced no path")
+    return Path(result)
+
+
 def show_path_picker(
     mode: Literal["file", "folder"],
     initial_dir: Path | str | None = None,
@@ -242,9 +371,11 @@ def show_path_picker(
 ) -> Path | None:
     """Present a native dialog; return the picked path or None on cancel.
 
-    Only one picker may run at a time; a concurrent call raises RuntimeError.
-    Raises RuntimeError when PowerShell is missing, the dialog process fails,
-    the session is non-interactive, or the dialog times out.
+    Uses the persistent worker for speed, falling back to a one-shot
+    subprocess if the worker fails. Only one picker may run at a time; a
+    concurrent call raises RuntimeError. Also raises RuntimeError when
+    PowerShell is missing, the session is non-interactive, or the dialog
+    times out.
     """
     if mode not in ("file", "folder"):
         raise ValueError(f"mode must be 'file' or 'folder', got: {mode}")
@@ -257,48 +388,13 @@ def show_path_picker(
         raise RuntimeError("a browse dialog is already open")
 
     try:
-        env = os.environ.copy()
-        env["DUKE_PICKER_MODE"] = mode
         initial = Path(initial_dir).expanduser() if initial_dir else None
-        env["DUKE_PICKER_INITIAL"] = str(initial) if initial and initial.is_dir() else ""
-
-        cmd = [
-            _find_powershell(),
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-STA",
-            "-Command",
-            _PS_SCRIPT,
-        ]
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        initial_str = str(initial) if initial and initial.is_dir() else ""
         try:
-            proc = subprocess.run(
-                cmd,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                creationflags=creationflags,
-            )
-        except _TimeoutExpired as exc:
-            raise RuntimeError(
-                f"native picker timed out after {int(timeout)}s - "
-                "is the app running on an interactive desktop?"
-            ) from exc
-        except OSError as exc:
-            raise RuntimeError(f"failed to launch native picker: {exc}") from exc
-
-        if proc.returncode != 0:
-            detail = proc.stderr.strip() or f"exit code {proc.returncode}"
-            raise RuntimeError(f"native picker failed: {detail}")
-
-        lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
-        result = lines[-1] if lines else ""
-        if result == _CANCELLED:
-            return None
-        if not result:
-            raise RuntimeError("native picker produced no path")
-        return Path(result)
+            return _pick_via_worker(mode, initial_str)
+        except Exception:
+            # Fallback: one-shot dialog process. Uses the same lock, so the
+            # single-active-picker guarantee still holds.
+            return _pick_oneshot(mode, initial, timeout=timeout)
     finally:
         _picker_lock.release()

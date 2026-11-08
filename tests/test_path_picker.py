@@ -7,6 +7,7 @@ runner and simulating loopback/remote clients.
 from __future__ import annotations
 
 import ctypes
+import io
 import subprocess
 import unittest
 from pathlib import Path
@@ -120,6 +121,48 @@ class BusyLockTests(unittest.TestCase):
             mock_sp.run.assert_not_called()
         finally:
             picker_module._picker_lock.release()
+
+
+class _FakeWorkerProc:
+    def __init__(self, reply: str):
+        self._reply = reply
+        self.stdin = io.StringIO()
+        self.stdout = io.StringIO(reply + "\n")
+
+    def poll(self):
+        return None
+
+
+class WorkerPickerTests(unittest.TestCase):
+    def setUp(self):
+        self._interactive = mock.patch.object(picker_module, "has_interactive_desktop", return_value=True)
+        self._interactive.start()
+        self.addCleanup(self._interactive.stop)
+        self._worker_patch = mock.patch.object(picker_module, "_spawn_worker")
+        self._spawn = self._worker_patch.start()
+        self.addCleanup(self._worker_patch.stop)
+
+    def test_worker_returns_path(self):
+        self._spawn.return_value = _FakeWorkerProc('{"path":"D:\\\\Trading\\\\TickData"}')
+        result = picker_module.show_path_picker("folder")
+        self.assertEqual(result, Path(r"D:\Trading\TickData"))
+        sent = self._spawn.return_value.stdin.getvalue()
+        self.assertIn('"mode": "folder"', sent)
+
+    def test_worker_cancel_returns_none(self):
+        self._spawn.return_value = _FakeWorkerProc('{"path":null}')
+        self.assertIsNone(picker_module.show_path_picker("folder"))
+
+    def test_worker_error_falls_back_to_oneshot(self):
+        # Worker returns garbage -> json parse fails -> fallback to one-shot
+        # (mocked subprocess.run), which still yields the path.
+        self._spawn.return_value = _FakeWorkerProc("not json")
+        picked = Path(r"D:\Fallback\Folder")
+        with mock.patch.object(picker_module, "subprocess") as mock_sp:
+            mock_sp.run.return_value = _fake_proc(str(picked) + "\n")
+            result = picker_module.show_path_picker("folder")
+        self.assertEqual(result, picked)
+        self.assertTrue(mock_sp.run.called)
 
 
 class PathPickEndpointTests(unittest.TestCase):
