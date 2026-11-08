@@ -160,6 +160,31 @@ it (a restart banner appears until you restart), and runs the same migration as
 a background copy+verify job — the old copy is kept; delete it later with the
 CLI command above.
 
+## Choosing paths without typing
+
+The Settings tab and `configure-paths.ps1` let you pick the three key paths
+from native Windows dialogs instead of typing them:
+
+- MT5 `terminal64.exe`
+- MT5 data folder
+- Tick data root
+
+**In the web UI:** each field has a **Browse…** button that opens the standard
+Windows dialog and fills + saves the path immediately. When the chosen MT5
+data folder equals the terminal folder, portable mode is enabled automatically
+(with a visible notice). Browse is only available when the UI is opened from
+the machine running the app (localhost); otherwise the buttons hide.
+
+**From PowerShell** (no browser needed):
+
+```powershell
+.\installer\configure-paths.ps1
+```
+
+It prints the current values first, then lets you configure 1/2/3/All and
+choose **Browse** or **Auto-detect** for each path. `install.ps1` offers it at
+the end of a fresh install.
+
 ## Layout
 
 ```
