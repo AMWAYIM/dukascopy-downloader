@@ -113,6 +113,53 @@ writes atomically, and preserves millisecond timestamps. In MT5, open the
 custom symbol's **Ticks** tab and choose **Import Ticks**. Use the default
 six-column mapping: date, time, bid, ask, last, volume.
 
+## Data folder (tick data root)
+
+All downloaded data lives in one **data root** — ticks
+(`<SYMBOL>/<year>/<month>/<day>/<hour>.bin`), the SQLite ledger
+(`metadata.db`), staging, CSV exports, logs, and web settings. By default
+that is the repo's `data/` directory; on a machine where your main drive is
+tight you can point it elsewhere.
+
+Resolution order (first match wins):
+
+1. `DUKE_DATA_DIR` environment variable (session override — handy for scripts)
+2. `<repo>/.dukascopy/data.json` (persistent; written by `data-config` or the Settings page)
+3. Default: `<repo>/data`
+
+Show the effective root:
+
+```powershell
+python main.py data-config --show
+```
+
+Set a persistent root (absolute path; validated, fail-fast):
+
+```powershell
+python main.py data-config --set D:\tickdata
+python main.py data-config --clear    # back to the repo default
+```
+
+The app refuses to start if the configured root cannot be used — there is no
+silent fallback.
+
+### Moving existing data
+
+To move the current dataset to a new root with the app stopped:
+
+```powershell
+python main.py migrate-data --to D:\tickdata --delete-source
+```
+
+`migrate-data` copies every file, verifies size counts, then deletes the old
+root only with `--delete-source`. It refuses while the web server is running
+and on non-empty destinations unless `--force`.
+
+With the web UI, **Settings → Tick data folder** shows the root, lets you set
+it (a restart banner appears until you restart), and runs the same migration as
+a background copy+verify job — the old copy is kept; delete it later with the
+CLI command above.
+
 ## Layout
 
 ```
@@ -126,5 +173,5 @@ mt5/             DukascopyTickImport.mq5
 config/          settings, instruments.json
 cli/             commands
 scripts/         migrate_parquet_to_bin.py
-data/            binary tick store + SQLite ledger   (created at runtime)
+data/            binary tick store + SQLite ledger   (default data root; see Data folder)
 ```
