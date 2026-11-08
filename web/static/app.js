@@ -114,7 +114,11 @@ async function api(path, opts = {}) {
     ...opts,
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(formatApiError(data, res.statusText));
+  if (!res.ok) {
+    const err = new Error(formatApiError(data, res.statusText));
+    err.status = res.status;
+    throw err;
+  }
   return data;
 }
 
@@ -1493,6 +1497,9 @@ function setPickerUnavailable(msg) {
 }
 
 async function browseForPath(target) {
+  if (state.pickerBusy) return; // one dialog at a time
+  state.pickerBusy = true;
+  document.querySelectorAll(".js-browse").forEach((b) => (b.disabled = true));
   const mode = target === "mt5-terminal" ? "file" : "folder";
   const initial =
     target === "mt5-terminal"
@@ -1507,9 +1514,12 @@ async function browseForPath(target) {
       body: JSON.stringify({ mode, initial_dir: initial || null }),
     });
   } catch (e) {
-    setPickerUnavailable(e.message);
+    if (e.status !== 409) setPickerUnavailable(e.message);
     toastError(e.message);
     return;
+  } finally {
+    state.pickerBusy = false;
+    document.querySelectorAll(".js-browse").forEach((b) => (b.disabled = false));
   }
   if (!res.path) return; // cancelled
 

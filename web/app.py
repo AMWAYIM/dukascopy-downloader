@@ -45,7 +45,7 @@ from web.jobs import (
     run_gaps_job,
     run_mt5_import_job,
 )
-from web.path_picker import has_interactive_desktop, show_path_picker
+from web.path_picker import has_interactive_desktop, is_picker_busy, show_path_picker
 from web.scheduler import get_scheduler, init_scheduler
 from web.settings_store import settings_store
 
@@ -842,6 +842,8 @@ async def pick_path(body: PathPickRequest, request: Request) -> dict[str, Any]:
             "cannot show a native dialog in this session - run the app from "
             "your desktop (not a service/SSH/scheduled task)",
         )
+    if is_picker_busy():
+        raise HTTPException(409, "a browse dialog is already open")
     initial = Path(body.initial_dir).expanduser() if body.initial_dir else None
     loop = asyncio.get_running_loop()
     try:
