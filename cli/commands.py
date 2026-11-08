@@ -145,6 +145,26 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("mt5-doctor", help="diagnose MT5 terminal/data-folder configuration")
 
+    p_data_config = sub.add_parser("data-config", help="show or update the tick data root")
+    dg = p_data_config.add_mutually_exclusive_group(required=True)
+    dg.add_argument("--set", metavar="PATH", default=None,
+                    help="persist an absolute data root")
+    dg.add_argument("--show", action="store_true",
+                    help="print the effective data root and its source")
+    dg.add_argument("--clear", action="store_true",
+                    help="remove the persisted data root (back to the repo default)")
+
+    p_migrate_data = sub.add_parser(
+        "migrate-data",
+        help="copy tick data to a new root (verify, then optionally delete source)",
+    )
+    p_migrate_data.add_argument("--to", metavar="PATH", required=True,
+                                help="destination data root (absolute)")
+    p_migrate_data.add_argument("--force", action="store_true",
+                                help="allow copying into a non-empty destination")
+    p_migrate_data.add_argument("--delete-source", action="store_true",
+                                help="delete the old root after the copy is verified")
+
     return parser
 
 
@@ -670,6 +690,69 @@ def cmd_web(args) -> int:
     return 0
 
 
+def cmd_data_config(settings: Settings, args) -> int:
+    from config.data_config import (
+        clear_configured_data_dir,
+        effective_data_dir,
+        save_configured_data_dir,
+        validate_data_dir,
+    )
+
+    if args.set is not None:
+        target = Path(args.set)
+        try:
+            validate_data_dir(target)
+            save_configured_data_dir(target)
+        except (ValueError, RuntimeError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(f"data root saved: {target} (restart the web UI to apply)")
+        return 0
+
+    if args.clear:
+        clear_configured_data_dir()
+        print("data root config cleared — using the repo default")
+        return 0
+
+    data_dir, source = effective_data_dir()
+    print(f"effective data root : {data_dir}")
+    print(f"source              : {source}")
+    return 0
+
+
+def cmd_migrate_data(settings: Settings, args) -> int:
+    from core.services.data_migration import migrate_data_dir
+
+    src = settings.data_dir
+    dst = Path(args.to)
+    if is_data_dir_locked(src):
+        print(
+            "error: the web server is running on this data root — stop it first",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        stats = migrate_data_dir(
+            src,
+            dst,
+            delete_source=args.delete_source,
+            force=args.force,
+        )
+    except (ValueError, RuntimeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Copied {stats['files_copied']:,} files "
+          f"({stats['bytes_copied']:,} bytes) to {dst}")
+    print(f"Verified {stats['files_verified']:,} files by size.")
+    if stats["source_deleted"]:
+        print(f"Old data root deleted: {src}")
+    else:
+        print(f"Old data root kept: {src} (re-run with --delete-source to remove it)")
+    return 0
+
+
 def cmd_status(settings: Settings, catalog: InstrumentCatalog, args) -> int:
     instrument = catalog.get(args.symbol)
     db = MetadataDB(settings.db_path)
@@ -720,6 +803,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_mt5_config(settings, args)
         if args.command == "mt5-doctor":
             return cmd_mt5_doctor(settings)
+        if args.command == "data-config":
+            return cmd_data_config(settings, args)
+        if args.command == "migrate-data":
+            return cmd_migrate_data(settings, args)
         if args.command == "web":
             return cmd_web(args)
     except UnknownInstrumentError as exc:
