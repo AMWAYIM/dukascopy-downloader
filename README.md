@@ -173,7 +173,9 @@ from native Windows dialogs instead of typing them:
 Windows dialog and fills + saves the path immediately. When the chosen MT5
 data folder equals the terminal folder, portable mode is enabled automatically
 (with a visible notice). Browse is only available when the UI is opened from
-the machine running the app (localhost); otherwise the buttons hide.
+the machine running the app (localhost); otherwise the buttons hide. Only one
+dialog can be open at a time (a second Browse click is ignored until the first
+closes), and cancelling never hides the buttons.
 
 **From PowerShell** (no browser needed):
 

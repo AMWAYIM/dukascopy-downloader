@@ -96,6 +96,32 @@ class InteractiveDesktopDetectionTests(unittest.TestCase):
             self.assertTrue(picker_module.has_interactive_desktop())
 
 
+class BusyLockTests(unittest.TestCase):
+    def setUp(self):
+        self._interactive = mock.patch.object(picker_module, "has_interactive_desktop", return_value=True)
+        self._interactive.start()
+        self.addCleanup(self._interactive.stop)
+
+    def test_lock_held_means_busy(self):
+        picker_module._picker_lock.acquire()
+        try:
+            self.assertTrue(picker_module.is_picker_busy())
+        finally:
+            picker_module._picker_lock.release()
+        self.assertFalse(picker_module.is_picker_busy())
+
+    def test_show_raises_when_busy(self):
+        picker_module._picker_lock.acquire()
+        try:
+            with mock.patch.object(picker_module, "subprocess") as mock_sp:
+                with self.assertRaises(RuntimeError) as ctx:
+                    picker_module.show_path_picker("folder")
+            self.assertIn("already open", str(ctx.exception))
+            mock_sp.run.assert_not_called()
+        finally:
+            picker_module._picker_lock.release()
+
+
 class PathPickEndpointTests(unittest.TestCase):
     def setUp(self):
         self._interactive = mock.patch.object(app_module, "has_interactive_desktop", return_value=True)
@@ -152,6 +178,16 @@ class PathPickEndpointTests(unittest.TestCase):
             with self.assertRaises(HTTPException) as ctx:
                 asyncio.run(pick_path(PathPickRequest(mode="folder"), self._request("127.0.0.1")))
         self.assertEqual(ctx.exception.status_code, 409)
+        mock_pick.assert_not_called()
+
+    def test_busy_returns_409(self):
+        import asyncio
+        with mock.patch.object(app_module, "is_picker_busy", return_value=True), \
+             mock.patch.object(app_module, "show_path_picker") as mock_pick:
+            with self.assertRaises(HTTPException) as ctx:
+                asyncio.run(pick_path(PathPickRequest(mode="folder"), self._request("127.0.0.1")))
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertIn("already open", str(ctx.exception.detail))
         mock_pick.assert_not_called()
 
 
