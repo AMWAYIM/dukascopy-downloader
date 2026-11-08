@@ -11,8 +11,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from export.mt5_csv import export_mt5_csv
-
-ROOT = Path(__file__).resolve().parents[1]
+from config.settings import Settings
 
 
 def source_files(data_dir: Path, years: set[int] | None) -> dict[int, list[Path]]:
@@ -47,8 +46,9 @@ def main() -> int:
     args = parser.parse_args()
 
     symbol = args.symbol.upper()
-    data_dir = ROOT / "data" / symbol
-    output_dir = ROOT / "data" / "mt5_csv" / symbol
+    data_root = Settings().data_dir
+    data_dir = data_root / symbol
+    output_dir = data_root / "mt5_csv" / symbol
     if not data_dir.is_dir():
         raise SystemExit(f"No downloaded data found: {data_dir}")
 
