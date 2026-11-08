@@ -637,7 +637,9 @@ function renderJobCard(job) {
       ? `Download · ${(params.symbols || []).join(", ")}`
       : job.kind === "mt5_import"
         ? `MT5 import · ${params.symbol}${params.import_all ? " (all recorded)" : ""}`
-        : `Gaps · ${(params.symbols || (params.symbol ? [params.symbol] : [])).join(", ")}`;
+        : job.kind === "data_migration"
+          ? `Migrate data · ${params.to || ""}`
+          : `Gaps · ${(params.symbols || (params.symbol ? [params.symbol] : [])).join(", ")}`;
 
   const headBtn = isJobActive(job.status)
     ? `<button type="button" class="job-cancel" data-cancel="${job.id}" aria-label="Cancel job">×</button>`
@@ -663,6 +665,8 @@ function renderJobCard(job) {
       } else {
         body += `<p class="hint">Gaps: ${r.gap_count ?? "?"} hour(s) missing or failed.</p>`;
       }
+    } else if (job.kind === "data_migration") {
+      body += `<p class="hint">${r.message || `Copied ${fmt(r.files_copied)} files`}</p>`;
     }
   }
   if (job.status === "failed") {
@@ -1374,6 +1378,17 @@ async function loadSettings() {
     if (portable) portable.checked = !!mt5.portable;
     state.automations = data.automations || [];
     renderAutomationsList();
+
+    const dataSettings = data.data || {};
+    state.dataSettings = dataSettings;
+    const dataInput = $("#set-data-dir");
+    if (dataInput) dataInput.value = dataSettings.dir || "";
+    const sourceLabel = $("#set-data-source");
+    if (sourceLabel) {
+      sourceLabel.textContent = `Now using: ${dataSettings.dir || ""} · source: ${dataSettings.source || "default"}`;
+    }
+    const banner = $("#data-restart-banner");
+    if (banner) banner.classList.toggle("hidden", !dataSettings.restart_required);
   } catch (e) {
     $("#auto-list").innerHTML = `<p class="empty">${e.message}</p>`;
   }
@@ -1410,6 +1425,41 @@ $("#set-dark-mode")?.addEventListener("change", (e) => {
   const theme = e.target.checked ? "dark" : "light";
   applyTheme(theme);
   saveUiSettings({ theme });
+});
+
+$("#set-data-save")?.addEventListener("click", async () => {
+  const target = ($("#set-data-dir")?.value || "").trim();
+  if (!target) {
+    toastError("Enter an absolute data root path");
+    return;
+  }
+  try {
+    await api("/api/settings/data", { method: "PATCH", body: JSON.stringify({ dir: target }) });
+    toastSuccess("Data root saved — restart to apply");
+    await loadSettings();
+  } catch (e) {
+    toastError(e.message);
+  }
+});
+
+$("#start-migrate-btn")?.addEventListener("click", async () => {
+  const target = ($("#set-data-dir")?.value || "").trim();
+  if (!target) {
+    toastError("Enter the destination data root first");
+    return;
+  }
+  if (state.dataSettings && target === state.dataSettings.dir) {
+    toastError("That is the current data root");
+    return;
+  }
+  try {
+    const job = await api("/api/migrate-data", { method: "POST", body: JSON.stringify({ to: target }) });
+    toastSuccess("Migration started — watch the Jobs tab");
+    switchTab("jobs", { save: false });
+    refreshJobs();
+  } catch (e) {
+    toastError(e.message);
+  }
 });
 
 $("#set-default-workers")?.addEventListener("change", (e) => {

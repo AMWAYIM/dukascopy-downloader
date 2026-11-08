@@ -240,6 +240,24 @@
       </div>
 
       <div class="card">
+        <h2>Tick data folder</h2>
+        <p class="hint">Where downloaded ticks, metadata.db, staging and exports live. Set rarely; the app must be restarted to pick up a new root.</p>
+        <div class="field">
+          <label for="set-data-dir">Data root</label>
+          <input type="text" id="set-data-dir" placeholder="C:\path\to\tickdata" spellcheck="false">
+          <p class="hint" id="set-data-source"></p>
+        </div>
+        <div id="data-restart-banner" class="banner-warn hidden">
+          <strong>Restart required.</strong> The app is still using the old root — stop the server and start it again to apply the new folder.
+        </div>
+        <div class="grid-2">
+          <button type="button" class="btn" id="set-data-save">Set as data root</button>
+          <button type="button" class="btn" id="start-migrate-btn">Migrate to this root…</button>
+        </div>
+        <p class="hint">Migrate copies everything to the new root (safe — the old copy is kept), then restart to switch. To delete the old copy afterwards run <code>main.py migrate-data --delete-source</code> with the app stopped.</p>
+      </div>
+
+      <div class="card">
         <h2>Automatic actions</h2>
         <p class="hint">Schedule recurring downloads. Example: daily at <strong>00:00</strong>, both day offsets <strong>2</strong> → on 14 Jun at midnight, download <strong>12 Jun</strong> for every symbol in your library.</p>
         <div id="auto-list" class="auto-list"><p class="empty">Loading…</p></div>

@@ -13,6 +13,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from core.exceptions import IncompleteDatasetError
+from config.data_config import (
+    effective_data_dir,
+    load_configured_data_dir,
+    save_configured_data_dir,
+    validate_data_dir,
+)
 from core.services.gap_scanner import GapScanner, require_complete_import
 from core.services.instrument_search import UnknownInstrumentError
 from core.services.jetta_metadata import fetch_instrument_info
@@ -32,6 +38,7 @@ from web.deps import catalog, db, settings, storage
 from web.jobs import (
     JobManager,
     resolve_symbol,
+    run_data_migration_job,
     run_download_job,
     run_gaps_job,
     run_mt5_import_job,
@@ -112,6 +119,15 @@ class Mt5RefreshRequest(BaseModel):
     # with prune_empty: the caller must have verified MT5 is empty via a
     # prior refresh moments earlier.
     skip_relist: bool = False
+
+
+class DataSettingsUpdate(BaseModel):
+    dir: str | None = None
+
+
+class DataMigrationRequest(BaseModel):
+    to: str
+    force: bool = False
 
 
 class GapsRequest(BaseModel):
@@ -737,11 +753,56 @@ async def preview_gaps(body: GapsRequest) -> dict[str, Any]:
 
 # -- settings & automations ---------------------------------------------------
 
+def _data_settings_payload() -> dict[str, Any]:
+    effective, source = effective_data_dir()
+    configured = load_configured_data_dir()
+    return {
+        "dir": str(effective),
+        "source": source,
+        "configured": str(configured) if configured else None,
+        "restart_required": configured is not None and configured != effective,
+    }
+
+
 @app.get("/api/settings")
 async def get_settings() -> dict[str, Any]:
     store = settings_store()
     automations = [_automation_public(r) for r in store.list_automations()]
-    return {"ui": store.get_ui(), "mt5": store.get_mt5(), "automations": automations}
+    return {
+        "ui": store.get_ui(),
+        "mt5": store.get_mt5(),
+        "automations": automations,
+        "data": _data_settings_payload(),
+    }
+
+
+@app.patch("/api/settings/data")
+async def patch_data_settings(body: DataSettingsUpdate) -> dict[str, Any]:
+    target = body.dir
+    if target is None or not target.strip():
+        raise HTTPException(400, "data dir must be an absolute path")
+    try:
+        validate_data_dir(Path(target))
+        save_configured_data_dir(target)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"data": _data_settings_payload()}
+
+
+@app.post("/api/migrate-data")
+async def start_data_migration(body: DataMigrationRequest) -> dict[str, Any]:
+    src = Path(settings().data_dir).resolve()
+    dst = Path(body.to).expanduser().resolve()
+    if dst == src:
+        raise HTTPException(400, "destination is the current data root")
+    if jobs.has_active_data_operation():
+        raise HTTPException(409, "wait for running jobs to finish before migrating")
+    job = jobs.submit(
+        "data_migration",
+        {"src": str(src), "to": str(dst), "force": body.force},
+        run_data_migration_job,
+    )
+    return job.to_dict()
 
 
 @app.patch("/api/settings/ui")

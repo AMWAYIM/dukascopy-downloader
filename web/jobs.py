@@ -171,6 +171,19 @@ class JobManager:
                 return True
         return False
 
+    def has_active_data_operation(self) -> bool:
+        """Any running/migration job that touches files or the DB (not ourselves)."""
+        with self._lock:
+            for job in self._jobs.values():
+                if job.kind == "data_migration":
+                    continue
+                if job.status not in (JobStatus.PENDING, JobStatus.RUNNING):
+                    continue
+                if job.is_cancelled():
+                    continue
+                return True
+        return False
+
 
 def _parse_date(value: str) -> date:
     return datetime.strptime(value, "%Y-%m-%d").date()
@@ -377,6 +390,49 @@ def run_mt5_import_job(
             range_label=str(result.get("range") or ""),
             mark_imported=True,
         )
+
+
+def run_data_migration_job(job: Job) -> None:
+    """Copy the live data root to a new location, verify, never delete source.
+
+    The web server runs on the source root, so it can never be deleted from
+    here — deletion is the CLI's job (`migrate-data --delete-source`) with
+    the server stopped.
+    """
+    from core.services.data_migration import migrate_data_dir
+
+    src = Path(job.params["src"])
+    dst = Path(job.params["to"])
+    force = bool(job.params.get("force", False))
+
+    job.set_progress(message="Starting migration…", phase="copy", percent=0)
+
+    def on_progress(done: int, total: int) -> None:
+        job.set_progress(
+            message=f"Copying {done:,} / {total:,} files",
+            phase="copy",
+            percent=round(100 * done / total, 1) if total else 0,
+            done=done,
+            total=total,
+        )
+        if job.is_cancelled():
+            raise JobCancelled()
+
+    stats = migrate_data_dir(
+        src,
+        dst,
+        delete_source=False,
+        force=force,
+        on_progress=on_progress,
+    )
+    if job.is_cancelled():
+        raise JobCancelled()
+    job.finish({
+        "files_copied": stats["files_copied"],
+        "bytes_copied": stats["bytes_copied"],
+        "files_verified": stats["files_verified"],
+        "message": f"Copied and verified {stats['files_verified']:,} files — restart to apply",
+    })
 
 
 def run_gaps_job(

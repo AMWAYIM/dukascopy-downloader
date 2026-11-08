@@ -1006,3 +1006,13 @@ th {
 .hidden {
   display: none !important;
 }
+
+.banner-warn {
+  margin-top: 0.6rem;
+  margin-bottom: 0.6rem;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+  color: var(--text);
+}
