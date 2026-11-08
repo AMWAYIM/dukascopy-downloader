@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import ctypes
 import io
+import os
+import shutil
 import subprocess
 import unittest
 from pathlib import Path
@@ -163,6 +165,32 @@ class WorkerPickerTests(unittest.TestCase):
             result = picker_module.show_path_picker("folder")
         self.assertEqual(result, picked)
         self.assertTrue(mock_sp.run.called)
+
+
+class CSharpCompileTests(unittest.TestCase):
+    """Compile the embedded C# for real (not a mocked subprocess).
+
+    The shipped defect was a C# source error that `Add-Type` rejected at
+    runtime; parse-only checks cannot catch it, so this test runs the
+    actual compiler with -ErrorAction Stop.
+    """
+
+    @unittest.skipUnless(os.name == "nt" and shutil.which("powershell"), "requires Windows PowerShell")
+    def test_csharp_source_compiles(self):
+        script = (
+            "$src = @'\n"
+            + picker_module._CORE_CSHARP
+            + "\n'@\n"
+            "Add-Type -TypeDefinition $src -ErrorAction Stop | Out-Null\n"
+        )
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-STA", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        self.assertEqual(proc.stderr.strip(), "", msg=proc.stderr)
 
 
 class PathPickEndpointTests(unittest.TestCase):
