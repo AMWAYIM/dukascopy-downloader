@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -25,6 +26,8 @@ from typing import Literal
 
 _CANCELLED = "__CANCELLED__"
 _PICKER_TIMEOUT = 45.0
+
+logger = logging.getLogger(__name__)
 
 _picker_lock = threading.Lock()
 _worker_proc: subprocess.Popen | None = None
@@ -112,10 +115,6 @@ namespace DukePicker
 
     public static class Native
     {
-        public static readonly Guid CLSID_FileOpenDialog = new Guid("DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7");
-        public static readonly Guid IID_IFileOpenDialog = new Guid("D57C7288-D4AD-4768-BE02-9D969532D960");
-        public static readonly Guid IID_IShellItem = new Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE");
-
         public const uint CLSCTX_INPROC_SERVER = 0x1;
 
         [DllImport("ole32.dll")]
@@ -135,8 +134,10 @@ namespace DukePicker
 
         public static string PickFolderOrFile(bool folder, string initialDir)
         {
+            Guid clsid = new Guid("DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7");
+            Guid iid = new Guid("D57C7288-D4AD-4768-BE02-9D969532D960");
             object raw;
-            int hr = CoCreateInstance(ref CLSID_FileOpenDialog, null, CLSCTX_INPROC_SERVER, ref IID_IFileOpenDialog, out raw);
+            int hr = CoCreateInstance(ref clsid, null, CLSCTX_INPROC_SERVER, ref iid, out raw);
             if (hr != 0) throw new COMException("CoCreateInstance failed: 0x" + hr.ToString("X8"));
 
             IFileOpenDialog dlg = (IFileOpenDialog)raw;
@@ -164,7 +165,8 @@ namespace DukePicker
             if (!string.IsNullOrEmpty(initialDir) && Directory.Exists(initialDir))
             {
                 object item;
-                hr = SHCreateItemFromParsingName(initialDir, IntPtr.Zero, ref IID_IShellItem, out item);
+                Guid iidShellItem = new Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE");
+                hr = SHCreateItemFromParsingName(initialDir, IntPtr.Zero, ref iidShellItem, out item);
                 if (hr == 0) dlg.SetFolder((IShellItem)item);
             }
 
@@ -191,7 +193,7 @@ $src = @'
 __CSHARP__
 '@
 try {
-    Add-Type -TypeDefinition $src
+    Add-Type -TypeDefinition $src -ErrorAction Stop
     $out = [DukePicker.Native]::PickFolderOrFile($mode -eq 'folder', $initial)
     if ($null -eq $out) { Write-Output '__CANCELLED__' } else { Write-Output $out }
 } catch {
@@ -219,7 +221,13 @@ _WORKER_SCRIPT = r"""
 $src = @'
 __CSHARP__
 '@
-Add-Type -TypeDefinition $src | Out-Null
+try {
+    Add-Type -TypeDefinition $src -ErrorAction Stop | Out-Null
+} catch {
+    $msg = $_.Exception.Message.Replace('\', '\\').Replace('"', '\"')
+    Write-Output ('{"error":"' + $msg + '"}')
+    exit 1
+}
 while ($true) {
     $line = [Console]::In.ReadLine()
     if ($null -eq $line) { break }
@@ -272,6 +280,25 @@ def has_interactive_desktop() -> bool:
         return True
 
 
+def _log_worker_stderr(proc: subprocess.Popen) -> None:
+    """Drain the worker's stderr into the module logger.
+
+    The PowerShell worker compiles C# at startup; without this, compile
+    errors would be silently discarded. stderr must not stay DEVNULL or a
+    blocked pipe could stall the child.
+    """
+    def _drain() -> None:
+        try:
+            for line in proc.stderr:  # type: ignore[union-attr]
+                line = line.rstrip()
+                if line:
+                    logger.error("picker worker stderr: %s", line)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("picker worker stderr drain stopped: %s", exc)
+
+    threading.Thread(target=_drain, name="picker-worker-stderr", daemon=True).start()
+
+
 def _spawn_worker() -> subprocess.Popen:
     global _worker_proc
     cmd = [
@@ -288,12 +315,13 @@ def _spawn_worker() -> subprocess.Popen:
         cmd,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
         creationflags=creationflags,
     )
+    _log_worker_stderr(_worker_proc)
     return _worker_proc
 
 
