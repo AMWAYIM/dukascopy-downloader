@@ -202,3 +202,24 @@ cli/             commands
 scripts/         migrate_parquet_to_bin.py
 data/            binary tick store + SQLite ledger   (default data root; see Data folder)
 ```
+
+## Git workflow (fork)
+
+This repository is a fork of
+[`Pin8al/dukascopy-downloader`](https://github.com/Pin8al/dukascopy-downloader).
+`main` is configured to **pull/rebase from `upstream`** and **push to
+`origin`** (your fork), so:
+
+```powershell
+# Pull latest upstream changes, rebasing local commits on top
+git pull
+
+# Push local commits to your fork (never to upstream)
+git push
+```
+
+- `git pull` never creates merge commits (`pull.rebase` is enabled).
+- If a rebase conflicts on a file you also changed, resolve and continue with
+  `git rebase --continue`.
+- The download job writes only to gitignored `data/` and `.dukascopy/`, so it
+  is unaffected by these git operations.
