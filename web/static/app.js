@@ -12,6 +12,7 @@ const state = {
   jobStatuses: new Map(),
   jobsPollTimer: null,
   datePickers: {},
+  pickerAvailable: true,
 };
 
 // -- utils --------------------------------------------------------------------
@@ -1472,6 +1473,73 @@ $("#set-data-default")?.addEventListener("click", async () => {
   } catch (e) {
     toastError(e.message);
   }
+});
+
+function dirName(pathStr) {
+  const s = String(pathStr || "").trim();
+  if (!s) return "";
+  const idx = Math.max(s.lastIndexOf("\\"), s.lastIndexOf("/"));
+  return idx === -1 ? "" : s.slice(0, idx);
+}
+
+function setPickerUnavailable() {
+  state.pickerAvailable = false;
+  document.querySelectorAll(".js-browse").forEach((b) => b.classList.add("hidden"));
+  const hint = $("#browse-unavailable");
+  if (hint) hint.classList.remove("hidden");
+}
+
+async function browseForPath(target) {
+  const mode = target === "mt5-terminal" ? "file" : "folder";
+  const initial =
+    target === "mt5-terminal"
+      ? ($("#set-mt5-terminal")?.value || "")
+      : target === "mt5-data"
+        ? ($("#set-mt5-data")?.value || "")
+        : ($("#set-data-dir")?.value || "");
+  let res;
+  try {
+    res = await api("/api/paths/pick", {
+      method: "POST",
+      body: JSON.stringify({ mode, initial_dir: initial || null }),
+    });
+  } catch (e) {
+    setPickerUnavailable();
+    toastError(e.message);
+    return;
+  }
+  if (!res.path) return; // cancelled
+
+  if (target === "mt5-terminal") {
+    $("#set-mt5-terminal").value = res.path;
+    queueMt5Save({ terminal_exe: res.path });
+    await flushMt5Save();
+  } else if (target === "mt5-data") {
+    const term = ($("#set-mt5-terminal")?.value || "").trim();
+    const portable = $("#set-mt5-portable");
+    const patch = { data_path: res.path };
+    $("#set-mt5-data").value = res.path;
+    if (term && !portable?.checked) {
+      const termDir = dirName(term).toLowerCase();
+      const pickedDir = res.path.trim().replace(/[\\/]+$/, "").toLowerCase();
+      if (termDir && termDir === pickedDir) {
+        patch.portable = true;
+        portable.checked = true;
+        toastSuccess("Portable mode enabled — data folder matches the terminal folder");
+      }
+    }
+    queueMt5Save(patch);
+    await flushMt5Save();
+  } else {
+    // tick root
+    await api("/api/settings/data", { method: "PATCH", body: JSON.stringify({ dir: res.path }) });
+    toastSuccess("Data root saved — restart to apply");
+    await loadSettings();
+  }
+}
+
+document.querySelectorAll(".js-browse").forEach((btn) => {
+  btn.addEventListener("click", () => browseForPath(btn.dataset.target));
 });
 
 $("#set-default-workers")?.addEventListener("change", (e) => {

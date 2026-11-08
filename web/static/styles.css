@@ -1016,3 +1016,18 @@ th {
   background: color-mix(in srgb, var(--warning) 12%, transparent);
   color: var(--text);
 }
+
+.field-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.field-row input {
+  flex: 1;
+}
+
+.field-row .btn-sm {
+  flex: none;
+  white-space: nowrap;
+}

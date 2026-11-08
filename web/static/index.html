@@ -214,12 +214,18 @@
         <h2>MetaTrader 5</h2>
         <div class="field">
           <label for="set-mt5-terminal">terminal64.exe path (optional)</label>
-          <input type="text" id="set-mt5-terminal" placeholder="Auto-detected when blank" spellcheck="false">
+          <div class="field-row">
+            <input type="text" id="set-mt5-terminal" placeholder="Auto-detected when blank" spellcheck="false">
+            <button type="button" class="btn btn-sm js-browse" data-target="mt5-terminal">Browse…</button>
+          </div>
           <p class="hint">Leave blank to auto-detect a running/installed terminal. Required for Import to MT5. Data folder is auto-detected unless overridden below.</p>
         </div>
         <div class="field">
           <label for="set-mt5-data">Data folder (optional)</label>
-          <input type="text" id="set-mt5-data" placeholder="%APPDATA%\MetaQuotes\Terminal\&lt;instance&gt;" spellcheck="false">
+          <div class="field-row">
+            <input type="text" id="set-mt5-data" placeholder="%APPDATA%\MetaQuotes\Terminal\&lt;instance&gt;" spellcheck="false">
+            <button type="button" class="btn btn-sm js-browse" data-target="mt5-data">Browse…</button>
+          </div>
           <p class="hint" id="set-mt5-data-hint">Roaming: leave portable off. Portable: set to the terminal folder itself.</p>
         </div>
         <div class="field">
@@ -244,9 +250,13 @@
         <p class="hint">Where downloaded ticks, metadata.db, staging and exports live. Set rarely; the app must be restarted to pick up a new root.</p>
         <div class="field">
           <label for="set-data-dir">Data root</label>
-          <input type="text" id="set-data-dir" placeholder="C:\path\to\tickdata" spellcheck="false">
+          <div class="field-row">
+            <input type="text" id="set-data-dir" placeholder="C:\path\to\tickdata" spellcheck="false">
+            <button type="button" class="btn btn-sm js-browse" data-target="tick-root">Browse…</button>
+          </div>
           <p class="hint">Enter the raw path as-is — <strong>no quotation marks</strong>. Example: <code>D:\tickdata</code></p>
           <p class="hint" id="set-data-source"></p>
+          <p class="hint hidden" id="browse-unavailable">Browse is unavailable — open the app from this machine to pick paths.</p>
         </div>
         <div id="data-restart-banner" class="banner-warn hidden">
           <strong>Restart required.</strong> The app is still using the old root — stop the server and start it again to apply the new folder.
