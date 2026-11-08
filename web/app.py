@@ -5,9 +5,9 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -44,6 +44,7 @@ from web.jobs import (
     run_gaps_job,
     run_mt5_import_job,
 )
+from web.path_picker import show_path_picker
 from web.scheduler import get_scheduler, init_scheduler
 from web.settings_store import settings_store
 
@@ -129,6 +130,11 @@ class DataSettingsUpdate(BaseModel):
 class DataMigrationRequest(BaseModel):
     to: str
     force: bool = False
+
+
+class PathPickRequest(BaseModel):
+    mode: Literal["file", "folder"] = "folder"
+    initial_dir: str | None = None
 
 
 class GapsRequest(BaseModel):
@@ -810,6 +816,31 @@ async def start_data_migration(body: DataMigrationRequest) -> dict[str, Any]:
         run_data_migration_job,
     )
     return job.to_dict()
+
+
+def _is_loopback_host(host: str | None) -> bool:
+    if not host:
+        return False
+    host = host.lower()
+    return host in ("127.0.0.1", "::1", "localhost") or host.endswith(":127.0.0.1")
+
+
+@app.post("/api/paths/pick")
+async def pick_path(body: PathPickRequest, request: Request) -> dict[str, Any]:
+    """Open a native file/folder dialog on this machine.
+
+    Only available to loopback clients: the dialog appears on the machine
+    running the server, so a remote browser must not be able to trigger it.
+    """
+    client_host = request.client.host if request.client else None
+    if not _is_loopback_host(client_host):
+        raise HTTPException(403, "browse is only available from this machine")
+    initial = Path(body.initial_dir).expanduser() if body.initial_dir else None
+    try:
+        picked = show_path_picker(body.mode, initial)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(500, f"native picker failed: {exc}") from exc
+    return {"path": str(picked) if picked else None}
 
 
 @app.patch("/api/settings/ui")
