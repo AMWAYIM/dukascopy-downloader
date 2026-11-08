@@ -14,6 +14,9 @@ venv/
 .dukascopy/
 .dukascopy.local.ps1
 
+# Local planning workspace written by the create-plan skill; deliberately not versioned.
+.plans/
+
 # Local / editor
 .env
 *.tmp
