@@ -7,8 +7,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import export.mt5_importer as mt5_importer
 from export.mt5_importer import (
     Mt5Settings,
+    _wait_for_mt5_import,
     parse_fresh_error_progress,
     root_progress_candidates,
     terminal_log_tail,
@@ -147,6 +149,134 @@ class ValidatePresetJobIdTests(unittest.TestCase):
             preset.write_text("JobId=other\n", encoding="utf-8")
             with self.assertRaises(ValueError):
                 validate_preset_job_id(preset, "abc-123")
+
+
+class WaitForImportRootProgressTests(unittest.TestCase):
+    JOB_ID = "28470673-f8d2-4d69-8367-1cf73b8e6a99"
+
+    def _portable_job(self, root: Path):
+        exe = _make_terminal(root)
+        mt5 = Mt5Settings.from_dict({"terminal_exe": str(exe), "portable": True})
+        jobs = mt5.data_path / "MQL5" / "Files" / "dukascopy_jobs"
+        job_dir = jobs / self.JOB_ID
+        job_dir.mkdir(parents=True, exist_ok=True)
+        return mt5, job_dir / "progress.txt"
+
+    def _root_progress(self, mt5) -> Path:
+        return mt5.data_path / "MQL5" / "Files" / "dukascopy_jobs" / "progress.txt"
+
+    @staticmethod
+    def _write_root_error(path: Path) -> None:
+        path.write_text(
+            "state=error\nphase=config\nmessage=JobId input is required\nerror_code=1\n",
+            encoding="utf-8",
+        )
+
+    def test_fresh_root_error_returns_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            mt5, progress_path = self._portable_job(root)
+            root_prog = self._root_progress(mt5)
+            self._write_root_error(root_prog)
+            appdata = root / "appdata"
+            appdata.mkdir()
+
+            class Clock:
+                def __init__(self) -> None:
+                    self.t = -0.01
+
+                def __call__(self) -> float:
+                    self.t += 0.01
+                    return self.t
+
+            with mock.patch.dict(os.environ, {"APPDATA": str(appdata)}):
+                with mock.patch.object(mt5_importer.time, "sleep", lambda _s: None):
+                    with mock.patch.object(
+                        mt5_importer.time, "monotonic", side_effect=Clock(),
+                    ):
+                        result = _wait_for_mt5_import(
+                            progress_path,
+                            job_id=self.JOB_ID,
+                            terminal_exe=mt5.terminal_exe,
+                            custom_name="BTCUSD.DUK",
+                            mt5=mt5,
+                        )
+            self.assertEqual(result["state"], "error")
+            self.assertEqual(result["message"], "JobId input is required")
+
+    def test_stale_root_error_does_not_short_circuit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            mt5, progress_path = self._portable_job(root)
+            root_prog = self._root_progress(mt5)
+            self._write_root_error(root_prog)
+            old = time.time() - 3600
+            os.utime(root_prog, (old, old))
+            appdata = root / "appdata"
+            appdata.mkdir()
+
+            class Clock:
+                def __init__(self) -> None:
+                    self.t = -0.5
+
+                def __call__(self) -> float:
+                    self.t += 0.5
+                    return self.t
+
+            with mock.patch.dict(os.environ, {"APPDATA": str(appdata)}):
+                with mock.patch.object(mt5_importer, "MT5_STARTUP_TIMEOUT_SEC", 1):
+                    with mock.patch.object(mt5_importer, "IMPORT_TIMEOUT_SEC", 3):
+                        with mock.patch.object(mt5_importer.time, "sleep", lambda _s: None):
+                            with mock.patch.object(
+                                mt5_importer.time, "monotonic", side_effect=Clock(),
+                            ):
+                                with self.assertRaises(RuntimeError):
+                                    _wait_for_mt5_import(
+                                        progress_path,
+                                        job_id=self.JOB_ID,
+                                        terminal_exe=mt5.terminal_exe,
+                                        custom_name="BTCUSD.DUK",
+                                        mt5=mt5,
+                                    )
+
+    def test_timeout_message_includes_terminal_log(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            mt5, progress_path = self._portable_job(root)
+            logs = mt5.data_path / "MQL5" / "Logs"
+            logs.mkdir(parents=True)
+            (logs / "20261111.log").write_text(
+                "JQ 0 20:05:58 DukascopyTickImport (BTCUSD,M1) JobId input is required\n",
+                encoding="utf-8",
+            )
+            appdata = root / "appdata"
+            appdata.mkdir()
+
+            class Clock:
+                def __init__(self) -> None:
+                    self.t = -0.5
+
+                def __call__(self) -> float:
+                    self.t += 0.5
+                    return self.t
+
+            with mock.patch.dict(os.environ, {"APPDATA": str(appdata)}):
+                with mock.patch.object(mt5_importer, "MT5_STARTUP_TIMEOUT_SEC", 1):
+                    with mock.patch.object(mt5_importer, "IMPORT_TIMEOUT_SEC", 3):
+                        with mock.patch.object(mt5_importer.time, "sleep", lambda _s: None):
+                            with mock.patch.object(
+                                mt5_importer.time, "monotonic", side_effect=Clock(),
+                            ):
+                                with self.assertRaises(RuntimeError) as ctx:
+                                    _wait_for_mt5_import(
+                                        progress_path,
+                                        job_id=self.JOB_ID,
+                                        terminal_exe=mt5.terminal_exe,
+                                        custom_name="BTCUSD.DUK",
+                                        mt5=mt5,
+                                    )
+            self.assertIn("DukascopyTickImport", str(ctx.exception))
+            self.assertIn("Last MT5 importer log", str(ctx.exception))
 
 
 if __name__ == "__main__":

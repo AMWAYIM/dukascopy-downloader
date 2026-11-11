@@ -952,11 +952,14 @@ def _wait_for_mt5_import(
     startup_deadline = started + MT5_STARTUP_TIMEOUT_SEC
     saw_progress = False
     extra_paths: list[Path] = []
+    root_candidates: list[Path] = []
     if mt5 is not None:
         extra_paths = [
             d / "progress.txt" for d in candidate_job_dirs(mt5, job_id)
             if (d / "progress.txt") != progress_path
         ]
+        root_candidates = root_progress_candidates(mt5)
+    started_wall = time.time()
 
     while time.monotonic() - started < IMPORT_TIMEOUT_SEC:
         if should_cancel and should_cancel():
@@ -967,12 +970,22 @@ def _wait_for_mt5_import(
         final_progress = parse_progress_file(progress_path)
         if not final_progress and extra_paths:
             final_progress = parse_progress_file_any(extra_paths)
+        if not final_progress and root_candidates:
+            # st_mtime is whole-second resolution; allow a small tolerance so a
+            # freshly written root error is not misread as stale.
+            final_progress = parse_fresh_error_progress(root_candidates, started_wall - 2.0)
         if final_progress:
             saw_progress = True
         elif not saw_progress and time.monotonic() > startup_deadline:
+            detail = ""
+            if mt5 is not None:
+                tail = terminal_log_tail(mt5.data_path)
+                if tail:
+                    detail = "\nLast MT5 importer log:\n" + tail[-800:]
             raise RuntimeError(
                 "MT5 did not start the import script within 2 minutes. "
-                "Close MetaTrader 5 completely and try again.",
+                "Close MetaTrader 5 completely and try again."
+                + detail,
             )
 
         state = str(final_progress.get("state", ""))
@@ -1068,6 +1081,7 @@ def _import_ticks_locked(
         script_set = mt5.data_path / "MQL5" / "presets" / "dukascopy_import.set"
         script_set.parent.mkdir(parents=True, exist_ok=True)
         write_script_set(script_set, job_id)
+        validate_preset_job_id(script_set, job_id)
 
         write_startup_ini(
             ini_path,
