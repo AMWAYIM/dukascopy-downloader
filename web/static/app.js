@@ -1586,6 +1586,29 @@ $("#set-mt5-suffix")?.addEventListener("change", (e) => {
 $("#set-mt5-origin")?.addEventListener("input", (e) => {
   queueMt5Save({ origin_symbol: e.target.value.trim() });
 });
+$("#load-mt5-symbols")?.addEventListener("click", async () => {
+  const btn = $("#load-mt5-symbols");
+  const dl = $("#mt5-symbols-list");
+  const count = $("#mt5-symbols-count");
+  btn.disabled = true;
+  try {
+    const { symbols } = await api("/api/mt5/symbols");
+    dl.innerHTML = "";
+    for (const s of symbols) {
+      const opt = document.createElement("option");
+      opt.value = s;
+      dl.appendChild(opt);
+    }
+    if (count) {
+      count.hidden = false;
+      count.textContent = `${symbols.length} symbols loaded from MT5`;
+    }
+  } catch (e) {
+    toastError(e.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
 $("#set-mt5-portable")?.addEventListener("change", async (e) => {
   await flushMt5Save();
   saveMt5Settings({ portable: e.target.checked });

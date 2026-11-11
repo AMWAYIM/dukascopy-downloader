@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -29,6 +30,7 @@ from export.mt5_importer import (
     diagnose_mt5,
     kill_mt5_terminal,
     list_terminal_processes,
+    list_terminal_symbols,
     normalize_suffix,
     wait_mt5_exit,
 )
@@ -604,6 +606,33 @@ def api_mt5_diagnostics() -> dict[str, Any]:
     diag = diagnose_mt5(mt5_config)
     diag["running_terminals"] = list_terminal_processes()
     return diag
+
+
+_MT5_SYMBOLS_CACHE: dict[str, Any] = {"ts": 0.0, "symbols": []}
+MT5_SYMBOLS_TTL_SEC = 180.0
+
+
+@app.get("/api/mt5/symbols")
+def api_mt5_symbols(refresh: bool = Query(False)) -> dict[str, Any]:
+    now = time.time()
+    cached = _MT5_SYMBOLS_CACHE
+    if not refresh and cached["symbols"] and now - cached["ts"] < MT5_SYMBOLS_TTL_SEC:
+        return {"symbols": cached["symbols"]}
+
+    store = settings_store()
+    mt5_config = store.get_mt5()
+    try:
+        Mt5Settings.validate_config(mt5_config)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    try:
+        symbols = list_terminal_symbols(mt5_config)
+    except Exception as exc:
+        raise HTTPException(502, f"Failed to enumerate MT5 symbols: {exc}") from exc
+
+    cached.update(ts=now, symbols=symbols)
+    return {"symbols": symbols}
 
 
 def _guess_source_symbol(custom_name: str, suffix: str) -> str:

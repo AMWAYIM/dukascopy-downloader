@@ -240,7 +240,12 @@
           </div>
           <div class="field">
             <label for="set-mt5-origin">Origin symbol override (optional)</label>
-            <input type="text" id="set-mt5-origin" placeholder="Broker symbol for contract specs">
+            <div class="field-row">
+              <input type="text" id="set-mt5-origin" placeholder="Broker symbol for contract specs" list="mt5-symbols-list">
+              <button type="button" class="btn btn-sm" id="load-mt5-symbols">Load symbols…</button>
+            </div>
+            <datalist id="mt5-symbols-list"></datalist>
+            <p class="hint hidden" id="mt5-symbols-count"></p>
           </div>
         </div>
       </div>

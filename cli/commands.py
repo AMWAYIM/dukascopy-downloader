@@ -8,6 +8,7 @@
     python main.py export-csv <SYMBOL> <START> <END> [--output PATH]
     python main.py mt5-config [--show] [--terminal PATH] [--data PATH]
                      [--portable | --roaming] [--suffix SUF] [--origin SYM]
+    python main.py mt5-symbols [--refresh] [--filter SUBSTR] [--set SYM]
     python main.py mt5-doctor
     python main.py migrate  [--dry-run] [--keep-parquet]
     python main.py web      [--host HOST] [--port PORT]
@@ -17,6 +18,7 @@ from __future__ import annotations
 import argparse
 import sys
 import threading
+import time
 from datetime import date, datetime
 from pathlib import Path
 
@@ -142,6 +144,14 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="portable terminal: data lives next to terminal64.exe, launch with /portable")
     mode.add_argument("--roaming", action="store_true",
                       help="normal install (default): data in %%APPDATA%%")
+
+    p_syms = sub.add_parser("mt5-symbols", help="list symbols available on the MT5 terminal")
+    p_syms.add_argument("--refresh", action="store_true",
+                        help="re-enumerate (ignore the short-lived cache)")
+    p_syms.add_argument("--filter", default=None,
+                        help="case-insensitive substring filter")
+    p_syms.add_argument("--set", default=None, metavar="SYM",
+                        help="validate SYM against the enumerated list, then set origin_symbol")
 
     sub.add_parser("mt5-doctor", help="diagnose MT5 terminal/data-folder configuration")
 
@@ -500,6 +510,49 @@ def cmd_mt5_doctor(settings: Settings) -> int:
     return 0
 
 
+_MT5_SYMBOLS_CACHE: dict = {"ts": 0.0, "symbols": []}
+MT5_SYMBOLS_TTL_SEC = 180.0
+
+
+def _enumerate_mt5_symbols(store, refresh: bool) -> list[str]:
+    now = time.time()
+    cached = _MT5_SYMBOLS_CACHE
+    if not refresh and cached["symbols"] and now - cached["ts"] < MT5_SYMBOLS_TTL_SEC:
+        return cached["symbols"]
+    from export.mt5_importer import list_terminal_symbols
+
+    symbols = list_terminal_symbols(store.get_mt5())
+    cached.update(ts=now, symbols=symbols)
+    return symbols
+
+
+def cmd_mt5_symbols(settings: Settings, args) -> int:
+    from web.settings_store import SettingsStore
+
+    store = SettingsStore(settings.data_dir / "web_settings.json")
+
+    if args.set is not None:
+        symbols = _enumerate_mt5_symbols(store, refresh=args.refresh)
+        if args.set not in symbols:
+            print(
+                f"error: '{args.set}' is not among the {len(symbols)} symbols on the terminal",
+                file=sys.stderr,
+            )
+            return 2
+        store.set_mt5({"origin_symbol": args.set})
+        print(f"Set origin_symbol={args.set}")
+        return 0
+
+    symbols = _enumerate_mt5_symbols(store, refresh=args.refresh)
+    if args.filter:
+        needle = args.filter.lower()
+        symbols = [s for s in symbols if needle in s.lower()]
+    for sym in symbols:
+        print(sym)
+    print(f"({len(symbols)} symbols)", file=sys.stderr)
+    return 0
+
+
 def _try_nonblocking_lock(handle) -> bool:
     """Try to claim byte 0 non-blocking. True when the claim succeeded.
 
@@ -803,6 +856,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_mt5_config(settings, args)
         if args.command == "mt5-doctor":
             return cmd_mt5_doctor(settings)
+        if args.command == "mt5-symbols":
+            return cmd_mt5_symbols(settings, args)
         if args.command == "data-config":
             return cmd_data_config(settings, args)
         if args.command == "migrate-data":
