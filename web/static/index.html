@@ -111,6 +111,16 @@
             <div id="ex-end-picker"></div>
           </div>
         </div>
+        <div class="field">
+          <label for="set-mt5-origin">Origin symbol override (optional)</label>
+          <div class="field-row">
+            <input type="text" id="set-mt5-origin" placeholder="Broker symbol for contract specs" list="mt5-symbols-list">
+            <button type="button" class="btn btn-sm" id="load-mt5-symbols">Load symbols…</button>
+          </div>
+          <datalist id="mt5-symbols-list"></datalist>
+          <p class="hint hidden" id="mt5-symbols-count"></p>
+          <p class="hint">Optional: broker symbol used as the chart/source for this import. Leave blank to use the instrument's own code.</p>
+        </div>
         <p class="hint" id="ex-import-hint">Requires MetaTrader 5 path in Settings. Launches MT5 to import ticks into a custom symbol.</p>
         <button class="btn btn-primary" id="ex-start-btn">Import to MT5</button>
       </div>
@@ -237,15 +247,6 @@
             <label for="set-mt5-suffix">Custom symbol suffix</label>
             <input type="text" id="set-mt5-suffix" value=".DUK" maxlength="12">
             <p class="hint">e.g. EURUSD → EURUSD.DUK</p>
-          </div>
-          <div class="field">
-            <label for="set-mt5-origin">Origin symbol override (optional)</label>
-            <div class="field-row">
-              <input type="text" id="set-mt5-origin" placeholder="Broker symbol for contract specs" list="mt5-symbols-list">
-              <button type="button" class="btn btn-sm" id="load-mt5-symbols">Load symbols…</button>
-            </div>
-            <datalist id="mt5-symbols-list"></datalist>
-            <p class="hint hidden" id="mt5-symbols-count"></p>
           </div>
         </div>
       </div>
