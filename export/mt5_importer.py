@@ -5,6 +5,7 @@ import hashlib
 import os
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -419,6 +420,105 @@ def validate_preset_job_id(preset_path: Path, job_id: str) -> None:
     text = preset_path.read_text(encoding="utf-8", errors="replace")
     if f"JobId={job_id}" not in text:
         raise ValueError(f"MT5 import preset is missing JobId={job_id}: {preset_path}")
+
+
+def _parse_symbols_file(path: Path) -> list[str]:
+    """Read a single-column symbols file into a sorted de-duplicated list."""
+    if not path.is_file():
+        return []
+    names = [
+        line.strip()
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines()
+        if line.strip()
+    ]
+    return sorted(set(names))
+
+
+def parse_symbols_file_any(paths: list[Path]) -> list[str]:
+    """Read the first non-empty single-column symbols file across candidates."""
+    for path in paths:
+        names = _parse_symbols_file(path)
+        if names:
+            return names
+    return []
+
+
+def list_terminal_symbols(
+    mt5_raw: dict[str, Any],
+    *,
+    timeout_sec: float = 120.0,
+    should_cancel: Callable[[], bool] | None = None,
+) -> list[str]:
+    """Enumerate market symbols available in the configured MT5 terminal.
+
+    Stages a ``list_available`` job, launches the terminal, waits for the
+    resulting ``symbols_all.txt`` (dual location), then shuts the terminal down
+    and cleans up. Held under the import lock so it cannot overlap a live
+    import.
+    """
+    with _import_lock:
+        return _list_terminal_symbols_locked(
+            mt5_raw, timeout_sec=timeout_sec, should_cancel=should_cancel,
+        )
+
+
+def _list_terminal_symbols_locked(
+    mt5_raw: dict[str, Any],
+    *,
+    timeout_sec: float,
+    should_cancel: Callable[[], bool] | None,
+) -> list[str]:
+    mt5 = Mt5Settings.from_dict(mt5_raw)
+    job_id = f"sym-{os.getpid()}-{int(time.time() * 1000)}"
+
+    job_dir = job_dir_for(mt5, job_id)
+    job_dir.mkdir(parents=True, exist_ok=True)
+    candidates = candidate_job_dirs(mt5, job_id)
+
+    staging_dir = Path(tempfile.mkdtemp(prefix="dukascopy-listing-"))
+    ini_path = staging_dir / "listing.ini"
+
+    kill_mt5_terminal(mt5.terminal_exe)
+    wait_mt5_exit(mt5.terminal_exe)
+
+    try:
+        write_manifest(job_dir / "manifest.txt", {"action": "list_available"})
+        script_set = mt5.data_path / "MQL5" / "presets" / "dukascopy_import.set"
+        script_set.parent.mkdir(parents=True, exist_ok=True)
+        write_script_set(script_set, job_id)
+        origin = str(mt5_raw.get("origin_symbol") or "EURUSD").strip() or "EURUSD"
+        write_startup_ini(ini_path, symbol=origin)
+        ensure_script_installed(mt5, should_cancel=should_cancel)
+
+        launch_mt5_background(mt5.terminal_exe, ini_path, portable=mt5.portable)
+
+        started = time.monotonic()
+        output_paths = [d / "symbols_all.txt" for d in candidates]
+        while time.monotonic() - started < timeout_sec:
+            if should_cancel and should_cancel():
+                raise JobCancelled()
+            names = parse_symbols_file_any(output_paths)
+            if names:
+                return names
+            progress = parse_progress_file_any(
+                [d / "progress.txt" for d in candidates]
+            )
+            if str(progress.get("state", "")) == "error":
+                msg = progress.get("message") or "MT5 symbol listing failed"
+                code = progress.get("error_code", "")
+                raise RuntimeError(f"{msg} (error {code})".strip())
+            time.sleep(0.5)
+
+        raise RuntimeError(
+            "MT5 did not produce the symbol list within "
+            f"{int(timeout_sec)}s — confirm the terminal is logged in and the "
+            "startup chart symbol exists.",
+        )
+    finally:
+        kill_mt5_terminal(mt5.terminal_exe)
+        wait_mt5_exit(mt5.terminal_exe)
+        cleanup_staging(mt5, job_id, remove_job_files=True, remove_script=False)
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 def write_manifest(path: Path, fields: dict[str, str]) -> None:

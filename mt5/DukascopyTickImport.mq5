@@ -745,6 +745,50 @@ bool ListCustomSymbols(const string customPath, const string suffix)
   }
 
 //+------------------------------------------------------------------+
+bool ListAvailableSymbols()
+  {
+   string outPath = JobDir() + "symbols_all.txt";
+   int outC = FileOpen(outPath, FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
+   int outL = FileOpen(outPath, FILE_WRITE | FILE_TXT | FILE_ANSI);
+   if(outC == INVALID_HANDLE && outL == INVALID_HANDLE)
+     {
+      WriteProgress("error", "list", 0, 0, 0, "", "Failed to open symbols_all.txt", GetLastError());
+      return false;
+     }
+
+   string names[];
+   int total = SymbolsTotal(false);
+   int listed = 0;
+   for(int i = 0; i < total; i++)
+     {
+      string sym = SymbolName(i, false);
+      bool isCustom = false;
+      if(SymbolExist(sym, isCustom) && isCustom)
+         continue;
+      ArrayResize(names, listed + 1);
+      names[listed++] = sym;
+     }
+   ArraySort(names);
+
+   for(int i = 0; i < listed; i++)
+     {
+      string line = names[i] + "\n";
+      if(outC != INVALID_HANDLE)
+         FileWriteString(outC, line);
+      if(outL != INVALID_HANDLE)
+         FileWriteString(outL, line);
+     }
+
+   if(outC != INVALID_HANDLE)
+      FileClose(outC);
+   if(outL != INVALID_HANDLE)
+      FileClose(outL);
+   WriteProgress("done", "list", 0, 0, 100, "",
+                "Listed " + IntegerToString(listed) + " available symbol(s)");
+   return true;
+  }
+
+//+------------------------------------------------------------------+
 int CloseChartsForSymbol(const string symbol)
   {
    int closed = 0;
@@ -988,6 +1032,13 @@ void OnStart()
       string suffix = ManifestValue("suffix");
       WriteProgress("running", "list", 0, 0, 0, "", "Listing custom symbols...");
       ListCustomSymbols(listPath, suffix);
+      return;
+     }
+
+   if(action == "list_available")
+     {
+      WriteProgress("running", "list", 0, 0, 0, "", "Listing available symbols...");
+      ListAvailableSymbols();
       return;
      }
 
