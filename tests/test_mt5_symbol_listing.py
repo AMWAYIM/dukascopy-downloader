@@ -86,13 +86,53 @@ class ListTerminalSymbolsTests(unittest.TestCase):
                                             ):
                                                 result = list_terminal_symbols(
                                                     {"terminal_exe": str(mt5.terminal_exe),
-                                                     "portable": True},
+                                                     "portable": True,
+                                                     "origin_symbol": "us"},
                                                 )
             self.assertEqual(result, ["EURUSD", "US30"])
             launch.assert_called_once()
             write_ini.assert_called_once()
+            # Enumeration must not depend on the (potentially invalid) origin.
             self.assertEqual(write_ini.call_args.kwargs["symbol"], "EURUSD")
             self.assertFalse(job_dir.exists())
+
+    def test_chart_symbol_override_is_honored(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            mt5, appdata = _portable_env(root)
+            job_dir = _job_dir(mt5)
+            job_dir.mkdir(parents=True)
+            (job_dir / "symbols_all.txt").write_text(
+                "USDJPY\n", encoding="utf-8"
+            )
+            with mock.patch.dict(os.environ, {"APPDATA": str(appdata)}):
+                with mock.patch.object(
+                    mt5_importer.time, "time", return_value=JOB_TS
+                ):
+                    with mock.patch.object(
+                        mt5_importer.os, "getpid", return_value=12345
+                    ):
+                        with mock.patch.object(mt5_importer, "kill_mt5_terminal"):
+                            with mock.patch.object(mt5_importer, "wait_mt5_exit"):
+                                with mock.patch.object(
+                                    mt5_importer, "ensure_script_installed",
+                                    return_value=Path("DukascopyTickImport.ex5"),
+                                ):
+                                    with mock.patch.object(
+                                        mt5_importer, "launch_mt5_background"
+                                    ):
+                                        with mock.patch.object(
+                                            mt5_importer, "write_startup_ini"
+                                        ) as write_ini:
+                                            with mock.patch.object(
+                                                mt5_importer.time, "sleep"
+                                            ):
+                                                list_terminal_symbols(
+                                                    {"terminal_exe": str(mt5.terminal_exe),
+                                                     "portable": True},
+                                                    chart_symbol="USDJPY",
+                                                )
+            self.assertEqual(write_ini.call_args.kwargs["symbol"], "USDJPY")
 
     def test_error_progress_raises_and_cleans_up(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -446,6 +446,7 @@ def parse_symbols_file_any(paths: list[Path]) -> list[str]:
 def list_terminal_symbols(
     mt5_raw: dict[str, Any],
     *,
+    chart_symbol: str | None = None,
     timeout_sec: float = 120.0,
     should_cancel: Callable[[], bool] | None = None,
 ) -> list[str]:
@@ -455,16 +456,25 @@ def list_terminal_symbols(
     resulting ``symbols_all.txt`` (dual location), then shuts the terminal down
     and cleans up. Held under the import lock so it cannot overlap a live
     import.
+
+    ``chart_symbol`` is the symbol MT5 opens a chart for in order to run the
+    script. It must exist on the account; it defaults to a safe, near-universal
+    symbol and is deliberately independent of ``origin_symbol`` (which the
+    picker exists to validate and may currently be blank or invalid).
     """
     with _import_lock:
         return _list_terminal_symbols_locked(
-            mt5_raw, timeout_sec=timeout_sec, should_cancel=should_cancel,
+            mt5_raw,
+            chart_symbol=chart_symbol,
+            timeout_sec=timeout_sec,
+            should_cancel=should_cancel,
         )
 
 
 def _list_terminal_symbols_locked(
     mt5_raw: dict[str, Any],
     *,
+    chart_symbol: str | None,
     timeout_sec: float,
     should_cancel: Callable[[], bool] | None,
 ) -> list[str]:
@@ -487,7 +497,8 @@ def _list_terminal_symbols_locked(
         script_set.parent.mkdir(parents=True, exist_ok=True)
         write_script_set(script_set, job_id)
         origin = str(mt5_raw.get("origin_symbol") or "EURUSD").strip() or "EURUSD"
-        write_startup_ini(ini_path, symbol=origin)
+        chart = (chart_symbol or "").strip() or "EURUSD"
+        write_startup_ini(ini_path, symbol=chart)
         ensure_script_installed(mt5, should_cancel=should_cancel)
 
         launch_mt5_background(mt5.terminal_exe, ini_path, portable=mt5.portable)

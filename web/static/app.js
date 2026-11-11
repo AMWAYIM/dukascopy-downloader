@@ -1583,14 +1583,16 @@ $("#set-mt5-data")?.addEventListener("input", (e) => {
 $("#set-mt5-suffix")?.addEventListener("change", (e) => {
   saveMt5Settings({ custom_suffix: e.target.value.trim() || ".DUK" });
 });
-$("#set-mt5-origin")?.addEventListener("input", (e) => {
+$("#set-mt5-origin")?.addEventListener("change", (e) => {
   queueMt5Save({ origin_symbol: e.target.value.trim() });
 });
 $("#load-mt5-symbols")?.addEventListener("click", async () => {
   const btn = $("#load-mt5-symbols");
   const dl = $("#mt5-symbols-list");
   const count = $("#mt5-symbols-count");
+  const originalLabel = btn.textContent;
   btn.disabled = true;
+  btn.textContent = "Loading…";
   try {
     const { symbols } = await api("/api/mt5/symbols");
     dl.innerHTML = "";
@@ -1607,6 +1609,7 @@ $("#load-mt5-symbols")?.addEventListener("click", async () => {
     toastError(e.message);
   } finally {
     btn.disabled = false;
+    btn.textContent = originalLabel;
   }
 });
 $("#set-mt5-portable")?.addEventListener("change", async (e) => {
