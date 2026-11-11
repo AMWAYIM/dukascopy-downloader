@@ -359,6 +359,68 @@ def parse_progress_file(path: Path) -> dict[str, Any]:
     return data
 
 
+def root_progress_candidates(mt5: Mt5Settings) -> list[Path]:
+    """Candidate jobs-root progress.txt locations (primary + fallback base)."""
+    bases: list[Path] = []
+    try:
+        bases.append(files_base_dir(mt5))
+    except ValueError:
+        pass
+    try:
+        other = common_files_dir() if mt5.portable else portable_files_dir(mt5.data_path)
+    except ValueError:
+        other = None
+    if other is not None and other not in bases:
+        bases.append(other)
+    return [base / JOB_ROOT / "progress.txt" for base in bases]
+
+
+def parse_fresh_error_progress(candidates: list[Path], min_mtime: float) -> dict[str, Any]:
+    """Return progress from a terminal-error file newer than ``min_mtime``."""
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if mtime < min_mtime:
+            continue
+        data = parse_progress_file(path)
+        if str(data.get("state", "")) == "error":
+            return data
+    return {}
+
+
+def terminal_log_tail(data_path: Path, max_lines: int = 20) -> str:
+    """Tail of the newest MQL5\\Logs\\<date>.log filtered to importer lines."""
+    logs_dir = data_path / "MQL5" / "Logs"
+    if not logs_dir.is_dir():
+        return ""
+    try:
+        logs = sorted(logs_dir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return ""
+    if not logs:
+        return ""
+    try:
+        lines = logs[0].read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    relevant = [ln for ln in lines if SCRIPT_BASE_NAME in ln or "[dukascopy]" in ln]
+    tail = relevant[-max_lines:] if relevant else lines[-max_lines:]
+    return "\n".join(tail)
+
+
+def validate_preset_job_id(preset_path: Path, job_id: str) -> None:
+    """Raise if the script preset is missing or lacks the JobId line."""
+    if not preset_path.is_file():
+        raise ValueError(f"MT5 import preset not found: {preset_path}")
+    text = preset_path.read_text(encoding="utf-8", errors="replace")
+    if f"JobId={job_id}" not in text:
+        raise ValueError(f"MT5 import preset is missing JobId={job_id}: {preset_path}")
+
+
 def write_manifest(path: Path, fields: dict[str, str]) -> None:
     lines = [f"{k}={v}" for k, v in fields.items()]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
