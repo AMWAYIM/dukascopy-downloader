@@ -1381,6 +1381,8 @@ async function loadSettings() {
     if (origin) origin.value = mt5.origin_symbol || "";
     const portable = $("#set-mt5-portable");
     if (portable) portable.checked = !!mt5.portable;
+    const warnOrigin = $("#set-mt5-warn-origin");
+    if (warnOrigin) warnOrigin.checked = mt5.warn_on_unknown_origin !== false;
     state.automations = data.automations || [];
     renderAutomationsList();
 
@@ -1409,6 +1411,7 @@ async function saveMt5Settings(patch) {
     if (mt5.custom_suffix != null) $("#set-mt5-suffix").value = mt5.custom_suffix;
     if (mt5.origin_symbol != null) $("#set-mt5-origin").value = mt5.origin_symbol;
     if (mt5.portable != null) $("#set-mt5-portable").checked = !!mt5.portable;
+    if (mt5.warn_on_unknown_origin != null) $("#set-mt5-warn-origin").checked = !!mt5.warn_on_unknown_origin;
   } catch (e) {
     toastError(e.message);
   }
@@ -1615,6 +1618,10 @@ $("#load-mt5-symbols")?.addEventListener("click", async () => {
 $("#set-mt5-portable")?.addEventListener("change", async (e) => {
   await flushMt5Save();
   saveMt5Settings({ portable: e.target.checked });
+});
+$("#set-mt5-warn-origin")?.addEventListener("change", async (e) => {
+  await flushMt5Save();
+  saveMt5Settings({ warn_on_unknown_origin: e.target.checked });
 });
 $("#dl-workers")?.addEventListener("input", () => {
   $("#dl-workers").dataset.userTouched = "1";

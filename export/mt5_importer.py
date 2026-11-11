@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 import os
 import shutil
 import subprocess
@@ -443,10 +445,80 @@ def parse_symbols_file_any(paths: list[Path]) -> list[str]:
     return []
 
 
+ORIGIN_CACHE_FILENAME = "mt5_symbols_cache.json"
+ORIGIN_CACHE_TTL_SEC = 24 * 3600
+
+
+def _origin_cache_path(data_dir: Path) -> Path:
+    return data_dir / ORIGIN_CACHE_FILENAME
+
+
+def load_last_known_symbols(
+    cache_path: Path,
+    *,
+    ttl_sec: float = ORIGIN_CACHE_TTL_SEC,
+) -> list[str] | None:
+    """Return the cached symbol list if fresh, else None (missing/stale/bad)."""
+    try:
+        if not cache_path.is_file():
+            return None
+        raw = json.loads(cache_path.read_text(encoding="utf-8"))
+        symbols = raw.get("symbols")
+        generated = raw.get("generated_at")
+        if not isinstance(symbols, list) or not isinstance(generated, str):
+            return None
+        created = datetime.fromisoformat(generated)
+        if (datetime.now(timezone.utc) - created).total_seconds() > ttl_sec:
+            return None
+        return [str(s) for s in symbols if str(s).strip()]
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def save_last_known_symbols(cache_path: Path, symbols: list[str]) -> None:
+    """Persist the enumerated symbol list (best-effort)."""
+    payload = {
+        "symbols": sorted(set(str(s).strip() for s in symbols if str(s).strip())),
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(cache_path)
+    except OSError:
+        pass
+
+
+def warn_if_origin_unknown(
+    origin: str,
+    cache_path: Path,
+    *,
+    enabled: bool = True,
+) -> str | None:
+    """Return a warning when an explicitly configured origin is not in the
+    last-known terminal symbol list. Returns None when disabled, origin blank,
+    no fresh cache, or the origin is present.
+    """
+    if not enabled or not origin.strip():
+        return None
+    known = load_last_known_symbols(cache_path)
+    if known is None:
+        return None
+    if origin.strip() in known:
+        return None
+    return (
+        f"Origin symbol '{origin}' is not among the {len(known)} last-known "
+        "MT5 symbols — the startup chart may fail to open. Load symbols from "
+        "the terminal and pick an existing broker symbol."
+    )
+
+
 def list_terminal_symbols(
     mt5_raw: dict[str, Any],
     *,
     chart_symbol: str | None = None,
+    cache_path: Path | None = None,
     timeout_sec: float = 120.0,
     should_cancel: Callable[[], bool] | None = None,
 ) -> list[str]:
@@ -461,11 +533,15 @@ def list_terminal_symbols(
     script. It must exist on the account; it defaults to a safe, near-universal
     symbol and is deliberately independent of ``origin_symbol`` (which the
     picker exists to validate and may currently be blank or invalid).
+
+    When ``cache_path`` is given, a successful enumeration is persisted there
+    (best-effort) so pre-import origin checks can run without relaunching MT5.
     """
     with _import_lock:
         return _list_terminal_symbols_locked(
             mt5_raw,
             chart_symbol=chart_symbol,
+            cache_path=cache_path,
             timeout_sec=timeout_sec,
             should_cancel=should_cancel,
         )
@@ -475,6 +551,7 @@ def _list_terminal_symbols_locked(
     mt5_raw: dict[str, Any],
     *,
     chart_symbol: str | None,
+    cache_path: Path | None,
     timeout_sec: float,
     should_cancel: Callable[[], bool] | None,
 ) -> list[str]:
@@ -510,6 +587,8 @@ def _list_terminal_symbols_locked(
                 raise JobCancelled()
             names = parse_symbols_file_any(output_paths)
             if names:
+                if cache_path is not None:
+                    save_last_known_symbols(cache_path, names)
                 return names
             progress = parse_progress_file_any(
                 [d / "progress.txt" for d in candidates]
@@ -1328,6 +1407,21 @@ def prepare_and_import(
     publisher = MT5TickPublisher(settings, store, planner, metadata)
     custom_name = custom_symbol_name(instrument.symbol, mt5.custom_suffix)
     origin = str(mt5_raw.get("origin_symbol") or instrument.symbol).strip() or instrument.symbol
+
+    origin_warning = warn_if_origin_unknown(
+        origin,
+        _origin_cache_path(settings.data_dir),
+        enabled=bool(mt5_raw.get("warn_on_unknown_origin", True)),
+    )
+    if origin_warning:
+        logging.getLogger(__name__).warning("%s", origin_warning)
+        if on_progress:
+            on_progress({
+                "message": origin_warning,
+                "percent": 1,
+                "phase": "prepare",
+                "custom_symbol": custom_name,
+            })
 
     def publish_progress(snapshot: dict[str, Any]) -> None:
         if not on_progress:

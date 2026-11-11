@@ -33,6 +33,7 @@ DEFAULT_MT5 = {
     "custom_suffix": ".DUK",
     "origin_symbol": "",
     "portable": False,
+    "warn_on_unknown_origin": True,
 }
 
 DEFAULT_AUTOMATION_ACTION = {

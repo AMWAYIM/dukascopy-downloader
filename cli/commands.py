@@ -500,6 +500,25 @@ def cmd_mt5_doctor(settings: Settings) -> int:
     if diag.get("error"):
         print(f"ERROR           : {diag['error']}")
         return 1
+    try:
+        from export.mt5_importer import load_last_known_symbols
+
+        known = load_last_known_symbols(settings.data_dir / "mt5_symbols_cache.json")
+    except Exception:
+        known = None
+    if known is None:
+        print("symbol cache     : none — run 'mt5-symbols --refresh' first")
+    else:
+        print(f"symbol cache     : {len(known)} symbols cached")
+    origin = str(store.get_mt5().get("origin_symbol") or "").strip()
+    if origin:
+        if known is None:
+            origin_status = "unknown (no cache)"
+        elif origin in known:
+            origin_status = "present in cache"
+        else:
+            origin_status = "MISSING from cache"
+        print(f"origin symbol    : {origin} [{origin_status}]")
     processes = list_terminal_processes()
     if processes:
         print(f"running         : {len(processes)} terminal64 process(es)")
@@ -514,14 +533,14 @@ _MT5_SYMBOLS_CACHE: dict = {"ts": 0.0, "symbols": []}
 MT5_SYMBOLS_TTL_SEC = 180.0
 
 
-def _enumerate_mt5_symbols(store, refresh: bool) -> list[str]:
+def _enumerate_mt5_symbols(store, refresh: bool, cache_path: Path) -> list[str]:
     now = time.time()
     cached = _MT5_SYMBOLS_CACHE
     if not refresh and cached["symbols"] and now - cached["ts"] < MT5_SYMBOLS_TTL_SEC:
         return cached["symbols"]
     from export.mt5_importer import list_terminal_symbols
 
-    symbols = list_terminal_symbols(store.get_mt5())
+    symbols = list_terminal_symbols(store.get_mt5(), cache_path=cache_path)
     cached.update(ts=now, symbols=symbols)
     return symbols
 
@@ -530,9 +549,10 @@ def cmd_mt5_symbols(settings: Settings, args) -> int:
     from web.settings_store import SettingsStore
 
     store = SettingsStore(settings.data_dir / "web_settings.json")
+    cache_path = settings.data_dir / "mt5_symbols_cache.json"
 
     if args.set is not None:
-        symbols = _enumerate_mt5_symbols(store, refresh=args.refresh)
+        symbols = _enumerate_mt5_symbols(store, refresh=args.refresh, cache_path=cache_path)
         if args.set not in symbols:
             print(
                 f"error: '{args.set}' is not among the {len(symbols)} symbols on the terminal",
@@ -543,7 +563,7 @@ def cmd_mt5_symbols(settings: Settings, args) -> int:
         print(f"Set origin_symbol={args.set}")
         return 0
 
-    symbols = _enumerate_mt5_symbols(store, refresh=args.refresh)
+    symbols = _enumerate_mt5_symbols(store, refresh=args.refresh, cache_path=cache_path)
     if args.filter:
         needle = args.filter.lower()
         symbols = [s for s in symbols if needle in s.lower()]

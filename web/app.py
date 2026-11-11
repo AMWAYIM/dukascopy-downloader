@@ -31,6 +31,7 @@ from export.mt5_importer import (
     kill_mt5_terminal,
     list_terminal_processes,
     list_terminal_symbols,
+    load_last_known_symbols,
     normalize_suffix,
     wait_mt5_exit,
 )
@@ -162,6 +163,7 @@ class Mt5SettingsUpdate(BaseModel):
     custom_suffix: str | None = None
     origin_symbol: str | None = None
     portable: bool | None = None
+    warn_on_unknown_origin: bool | None = None
 
 
 class AutomationScheduleModel(BaseModel):
@@ -605,6 +607,15 @@ def api_mt5_diagnostics() -> dict[str, Any]:
     mt5_config = settings_store().get_mt5()
     diag = diagnose_mt5(mt5_config)
     diag["running_terminals"] = list_terminal_processes()
+    cache_path = settings().data_dir / "mt5_symbols_cache.json"
+    known = load_last_known_symbols(cache_path)
+    origin = str(mt5_config.get("origin_symbol") or "").strip()
+    diag["symbol_cache"] = {
+        "available": known is not None,
+        "count": len(known) if known is not None else 0,
+        "origin_configured": bool(origin),
+        "origin_in_list": (origin in known) if known is not None else None,
+    }
     return diag
 
 
@@ -626,8 +637,9 @@ def api_mt5_symbols(refresh: bool = Query(False)) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
+    cache_path = settings().data_dir / "mt5_symbols_cache.json"
     try:
-        symbols = list_terminal_symbols(mt5_config)
+        symbols = list_terminal_symbols(mt5_config, cache_path=cache_path)
     except Exception as exc:
         raise HTTPException(502, f"Failed to enumerate MT5 symbols: {exc}") from exc
 

@@ -242,6 +242,10 @@
           <label class="checkbox"><input type="checkbox" id="set-mt5-portable"> Portable terminal (launch with /portable)</label>
           <p class="hint">Off by default (normal install, data in %APPDATA%). Turn on only when the data folder lives next to terminal64.exe.</p>
         </div>
+        <div class="field">
+          <label class="checkbox"><input type="checkbox" id="set-mt5-warn-origin" checked> Warn when the origin symbol isn't on the terminal</label>
+          <p class="hint">Checks the last-known symbol list before an import; the import still runs, but the warning helps catch a wrong broker symbol.</p>
+        </div>
         <div class="grid-2">
           <div class="field">
             <label for="set-mt5-suffix">Custom symbol suffix</label>
