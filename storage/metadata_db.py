@@ -49,6 +49,12 @@ _COMPLETED = TaskStatus.COMPLETED.value
 _BUSY_TIMEOUT_MS = 30_000
 _LOCKED_RETRIES = 3
 
+# Memory-mapped reads are disabled: an mmap view of the DB or WAL can be
+# invalidated by another connection/process truncating or checkpointing the
+# files, which SQLite reports as transient "disk I/O error". The ledger's
+# queries are short and indexed, so reads stay fast without mmap.
+_MMAP_SIZE_BYTES = 0
+
 
 def _is_locked_error(exc: Exception) -> bool:
     return isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
@@ -90,6 +96,7 @@ class MetadataDB:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+        conn.execute(f"PRAGMA mmap_size={_MMAP_SIZE_BYTES}")
         return conn
 
     def _with_transient_retry(self, fn):
@@ -478,10 +485,15 @@ class MetadataDB:
         self._uncommitted = 0
         # Fold the WAL into the main db file so the write survives even if
         # the -wal/-shm sidecars are lost across a restart (cloud-synced
-        # folders, hard kills, file copies). Degrades gracefully under
-        # cross-process read locks: PRAGMA reports busy instead of raising.
+        # folders, hard kills, file copies). PASSIVE is used deliberately:
+        # TRUNCATE would also shrink the -wal file to zero bytes, which
+        # invalidates other live connections' view of the WAL and can
+        # surface as transient "disk I/O error" reads elsewhere. The data
+        # root is a local fixed drive, so the TRUNCATE benefit does not
+        # apply. Degrades gracefully under cross-process read locks:
+        # PRAGMA reports busy instead of raising.
         try:
-            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
         except sqlite3.Error:
             pass
 
