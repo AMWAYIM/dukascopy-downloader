@@ -54,6 +54,21 @@ def _is_locked_error(exc: Exception) -> bool:
     return isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
 
 
+def _is_io_error(exc: Exception) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and "i/o error" in str(exc).lower()
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    """True for momentary SQLite OperationalErrors worth a retry.
+
+    Two families are treated as transient: cross-process write contention
+    ("database is locked") and filesystem-level hiccups that SQLite surfaces
+    verbatim ("disk I/O error"). Anything else (corruption, full disk,
+    schema errors) must propagate immediately.
+    """
+    return _is_locked_error(exc) or _is_io_error(exc)
+
+
 def _hour_key(hour: datetime) -> str:
     return hour.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:00:00")
 
@@ -62,36 +77,50 @@ class MetadataDB:
     def __init__(self, db_path: Path):
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=30.0)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+        self._db_path = db_path
+        self._conn = self._connect()
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
         self._uncommitted = 0
         self._commit_every = 32
 
-    def _with_locked_retry(self, fn) -> None:
-        """Run fn(), retrying through momentary cross-process DB locks.
+    def _connect(self) -> sqlite3.Connection:
+        """Open a fresh SQLite connection with the ledger's PRAGMAs applied."""
+        conn = sqlite3.connect(str(self._db_path), check_same_thread=False, timeout=30.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+        return conn
+
+    def _with_transient_retry(self, fn):
+        """Run fn(), retrying through momentary DB lock / I/O errors.
 
         A failed write leaves a stale snapshot behind; roll back before
         retrying or every later attempt fails instantly with the same error.
-        (fn releases self._lock as its exception propagates, so taking it
-        here for the rollback cannot deadlock.)
+        An I/O error can also leave the underlying connection wedged, so it
+        is closed and reopened before the next attempt. (fn releases
+        self._lock as its exception propagates, so taking it here for the
+        rollback/reopen cannot deadlock.)
         """
         for attempt in range(_LOCKED_RETRIES + 1):
             try:
-                fn()
-                return
+                return fn()
             except sqlite3.OperationalError as exc:
-                if not _is_locked_error(exc) or attempt >= _LOCKED_RETRIES:
+                if not _is_transient_error(exc) or attempt >= _LOCKED_RETRIES:
                     raise
                 with self._lock:
                     try:
                         self._conn.rollback()
                     except sqlite3.Error:
                         pass
+                    if _is_io_error(exc):
+                        try:
+                            self._conn.close()
+                        except sqlite3.Error:
+                            pass
+                        self._conn = self._connect()
                 time.sleep(2.0 * (attempt + 1))
+        raise AssertionError("unreachable")
 
     def close(self) -> None:
         with self._lock:
@@ -142,7 +171,7 @@ class MetadataDB:
                     self._conn.commit()
                     self._uncommitted = 0
 
-        self._with_locked_retry(_do_mark)
+        self._with_transient_retry(_do_mark)
 
     def flush(self) -> None:
         def _do_flush() -> None:
@@ -151,7 +180,7 @@ class MetadataDB:
                     self._conn.commit()
                     self._uncommitted = 0
 
-        self._with_locked_retry(_do_flush)
+        self._with_transient_retry(_do_flush)
 
     # -- reads -------------------------------------------------------------
 
@@ -159,38 +188,51 @@ class MetadataDB:
         self, instrument_id: str, start_hour: datetime, end_hour: datetime
     ) -> dict[str, str]:
         """{hour_key: status} for all recorded hours in [start_hour, end_hour]."""
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT hour_utc, status FROM hour_status
-                WHERE instrument=? AND hour_utc BETWEEN ? AND ?
-                """,
-                (instrument_id, _hour_key(start_hour), _hour_key(end_hour)),
-            ).fetchall()
-        return dict(rows)
+
+        def _run() -> dict[str, str]:
+            with self._lock:
+                rows = self._conn.execute(
+                    """
+                    SELECT hour_utc, status FROM hour_status
+                    WHERE instrument=? AND hour_utc BETWEEN ? AND ?
+                    """,
+                    (instrument_id, _hour_key(start_hour), _hour_key(end_hour)),
+                ).fetchall()
+            return dict(rows)
+
+        return self._with_transient_retry(_run)
 
     def summary(self, instrument_id: str) -> dict:
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT status, COUNT(*), COALESCE(SUM(tick_count), 0)
-                FROM hour_status WHERE instrument=? GROUP BY status
-                """,
-                (instrument_id,),
-            ).fetchall()
-            span = self._conn.execute(
-                "SELECT MIN(hour_utc), MAX(hour_utc) FROM hour_status WHERE instrument=?",
-                (instrument_id,),
-            ).fetchone()
-        by_status = {status: {"hours": count, "ticks": ticks} for status, count, ticks in rows}
-        return {"by_status": by_status, "first_hour": span[0], "last_hour": span[1]}
+        def _run() -> dict:
+            with self._lock:
+                rows = self._conn.execute(
+                    """
+                    SELECT status, COUNT(*), COALESCE(SUM(tick_count), 0)
+                    FROM hour_status WHERE instrument=? GROUP BY status
+                    """,
+                    (instrument_id,),
+                ).fetchall()
+                span = self._conn.execute(
+                    "SELECT MIN(hour_utc), MAX(hour_utc) FROM hour_status WHERE instrument=?",
+                    (instrument_id,),
+                ).fetchone()
+            by_status = {
+                status: {"hours": count, "ticks": ticks}
+                for status, count, ticks in rows
+            }
+            return {"by_status": by_status, "first_hour": span[0], "last_hour": span[1]}
+
+        return self._with_transient_retry(_run)
 
     def list_instruments(self) -> list[str]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT DISTINCT instrument FROM hour_status ORDER BY instrument",
-            ).fetchall()
-        return [row[0] for row in rows]
+        def _run() -> list[str]:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT DISTINCT instrument FROM hour_status ORDER BY instrument",
+                ).fetchall()
+            return [row[0] for row in rows]
+
+        return self._with_transient_retry(_run)
 
     def delete_instrument(self, instrument_id: str) -> int:
         """Remove all ledger rows for an instrument. Returns rows deleted."""
@@ -207,7 +249,7 @@ class MetadataDB:
                 self._uncommitted = 0
                 deleted = cur.rowcount
 
-        self._with_locked_retry(_do_delete)
+        self._with_transient_retry(_do_delete)
         return deleted
 
     def list_completed_hours(
@@ -217,28 +259,32 @@ class MetadataDB:
         end_hour: datetime,
     ) -> list[tuple[datetime, int]]:
         """Completed hours with tick counts, sorted ascending."""
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT hour_utc, tick_count FROM hour_status
-                WHERE instrument=? AND status=? AND tick_count > 0
-                  AND hour_utc BETWEEN ? AND ?
-                ORDER BY hour_utc
-                """,
+
+        def _run() -> list[tuple[datetime, int]]:
+            with self._lock:
+                rows = self._conn.execute(
+                    """
+                    SELECT hour_utc, tick_count FROM hour_status
+                    WHERE instrument=? AND status=? AND tick_count > 0
+                      AND hour_utc BETWEEN ? AND ?
+                    ORDER BY hour_utc
+                    """,
+                    (
+                        instrument_id,
+                        _COMPLETED,
+                        _hour_key(start_hour),
+                        _hour_key(end_hour),
+                    ),
+                ).fetchall()
+            return [
                 (
-                    instrument_id,
-                    _COMPLETED,
-                    _hour_key(start_hour),
-                    _hour_key(end_hour),
-                ),
-            ).fetchall()
-        return [
-            (
-                datetime.fromisoformat(hour_utc).replace(tzinfo=timezone.utc),
-                int(tick_count),
-            )
-            for hour_utc, tick_count in rows
-        ]
+                    datetime.fromisoformat(hour_utc).replace(tzinfo=timezone.utc),
+                    int(tick_count),
+                )
+                for hour_utc, tick_count in rows
+            ]
+
+        return self._with_transient_retry(_run)
 
     def list_completed_sources(
         self,
@@ -247,29 +293,33 @@ class MetadataDB:
         end_hour: datetime,
     ) -> list[tuple[str, int]]:
         """Tick file paths and tick counts for completed hours (no filesystem checks)."""
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT hour_utc, tick_count, file_path FROM hour_status
-                WHERE instrument=? AND status=? AND tick_count > 0
-                  AND hour_utc BETWEEN ? AND ?
-                ORDER BY hour_utc
-                """,
+
+        def _run() -> list[tuple[str, int]]:
+            with self._lock:
+                rows = self._conn.execute(
+                    """
+                    SELECT hour_utc, tick_count, file_path FROM hour_status
+                    WHERE instrument=? AND status=? AND tick_count > 0
+                      AND hour_utc BETWEEN ? AND ?
+                    ORDER BY hour_utc
+                    """,
+                    (
+                        instrument_id,
+                        _COMPLETED,
+                        _hour_key(start_hour),
+                        _hour_key(end_hour),
+                    ),
+                ).fetchall()
+            return [
                 (
-                    instrument_id,
-                    _COMPLETED,
-                    _hour_key(start_hour),
-                    _hour_key(end_hour),
-                ),
-            ).fetchall()
-        return [
-            (
-                file_path or "",
-                int(tick_count),
-                hour_utc,
-            )
-            for hour_utc, tick_count, file_path in rows
-        ]
+                    file_path or "",
+                    int(tick_count),
+                    hour_utc,
+                )
+                for hour_utc, tick_count, file_path in rows
+            ]
+
+        return self._with_transient_retry(_run)
 
     def sum_completed_ticks(
         self,
@@ -277,44 +327,55 @@ class MetadataDB:
         start_hour: datetime,
         end_hour: datetime,
     ) -> int:
-        with self._lock:
-            row = self._conn.execute(
-                """
-                SELECT COALESCE(SUM(tick_count), 0) FROM hour_status
-                WHERE instrument=? AND status=? AND tick_count > 0
-                  AND hour_utc BETWEEN ? AND ?
-                """,
-                (
-                    instrument_id,
-                    _COMPLETED,
-                    _hour_key(start_hour),
-                    _hour_key(end_hour),
-                ),
-            ).fetchone()
-        return int(row[0] if row else 0)
+        def _run() -> int:
+            with self._lock:
+                row = self._conn.execute(
+                    """
+                    SELECT COALESCE(SUM(tick_count), 0) FROM hour_status
+                    WHERE instrument=? AND status=? AND tick_count > 0
+                      AND hour_utc BETWEEN ? AND ?
+                    """,
+                    (
+                        instrument_id,
+                        _COMPLETED,
+                        _hour_key(start_hour),
+                        _hour_key(end_hour),
+                    ),
+                ).fetchone()
+            return int(row[0] if row else 0)
+
+        return self._with_transient_retry(_run)
 
     def replace_file_path(self, old_path: str, new_path: str) -> int:
         """Update ledger rows that reference old_path. Returns rows changed."""
-        with self._lock:
-            cur = self._conn.execute(
-                "UPDATE hour_status SET file_path=? WHERE file_path=?",
-                (new_path, old_path),
-            )
-            self._uncommitted += 1
-        return cur.rowcount
+
+        def _run() -> int:
+            with self._lock:
+                cur = self._conn.execute(
+                    "UPDATE hour_status SET file_path=? WHERE file_path=?",
+                    (new_path, old_path),
+                )
+                self._uncommitted += 1
+            return cur.rowcount
+
+        return self._with_transient_retry(_run)
 
     def rewrite_parquet_paths(self) -> int:
         """Rewrite any remaining .parquet paths in the ledger to .bin."""
-        with self._lock:
-            cur = self._conn.execute(
-                """
-                UPDATE hour_status
-                SET file_path = REPLACE(file_path, '.parquet', '.bin')
-                WHERE file_path LIKE '%.parquet'
-                """,
-            )
-            self._uncommitted += 1
-        return cur.rowcount
+
+        def _run() -> int:
+            with self._lock:
+                cur = self._conn.execute(
+                    """
+                    UPDATE hour_status
+                    SET file_path = REPLACE(file_path, '.parquet', '.bin')
+                    WHERE file_path LIKE '%.parquet'
+                    """,
+                )
+                self._uncommitted += 1
+            return cur.rowcount
+
+        return self._with_transient_retry(_run)
 
     def recorded_span(self, instrument_id: str) -> tuple[datetime, datetime] | None:
         """First and last hour recorded in the ledger for this instrument."""
@@ -349,16 +410,19 @@ class MetadataDB:
         }
 
     def list_mt5_custom_symbols(self) -> list[dict]:
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT symbol, source_symbol, ticks, first_ms, last_ms,
-                       range_label, imported_at, synced_at
-                FROM mt5_custom_symbol
-                ORDER BY symbol
-                """,
-            ).fetchall()
-        return [self._mt5_symbol_row(r) for r in rows]
+        def _run() -> list[dict]:
+            with self._lock:
+                rows = self._conn.execute(
+                    """
+                    SELECT symbol, source_symbol, ticks, first_ms, last_ms,
+                           range_label, imported_at, synced_at
+                    FROM mt5_custom_symbol
+                    ORDER BY symbol
+                    """,
+                ).fetchall()
+            return [self._mt5_symbol_row(r) for r in rows]
+
+        return self._with_transient_retry(_run)
 
     @staticmethod
     def _norm_mt5_symbol(entry: dict) -> str:
@@ -453,7 +517,7 @@ class MetadataDB:
                 )
                 self._commit_mt5_write()
 
-        self._with_locked_retry(_do_upsert)
+        self._with_transient_retry(_do_upsert)
 
     def delete_mt5_custom_symbol(self, symbol: str) -> None:
         def _do_delete() -> None:
@@ -461,7 +525,7 @@ class MetadataDB:
                 self._conn.execute("DELETE FROM mt5_custom_symbol WHERE symbol=?", (symbol,))
                 self._commit_mt5_write()
 
-        self._with_locked_retry(_do_delete)
+        self._with_transient_retry(_do_delete)
 
     def sync_mt5_custom_symbols(
         self,
@@ -521,5 +585,5 @@ class MetadataDB:
                 removed = sorted(stale)
                 pruned = True
 
-        self._with_locked_retry(_do_sync)
+        self._with_transient_retry(_do_sync)
         return removed, pruned
