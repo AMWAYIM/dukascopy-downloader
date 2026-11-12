@@ -37,6 +37,31 @@ class DataDirLockProbeTests(unittest.TestCase):
                 holder.close()
             self.assertFalse(is_data_dir_locked(Path(tmp)))
 
+    def test_second_acquire_refused_while_child_holds(self):
+        """A second acquire must be refused while another process holds the lock.
+
+        This is the exact guard that stops a second web server from starting on
+        the same data root. Lock semantics are per-process, so the contender
+        must be a separate process — a same-process second acquire could
+        spuriously succeed.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = multiprocessing.get_context("spawn")
+            ready = ctx.Queue()
+            done = ctx.Queue()
+            proc = ctx.Process(target=_hold_lock_in_child, args=(tmp, ready, done))
+            proc.start()
+            try:
+                self.assertTrue(ready.get(timeout=15), "child failed to acquire lock")
+                second = _acquire_data_dir_lock(Path(tmp))
+                self.assertIsNone(second, "second acquire must be refused while first holds")
+            finally:
+                done.put(True)
+                proc.join(timeout=15)
+            after = _acquire_data_dir_lock(Path(tmp))
+            self.assertIsNotNone(after, "lock must be free again after the holder releases")
+            after.close()
+
     def test_held_lock_in_child_process_reports_locked(self):
         with tempfile.TemporaryDirectory() as tmp:
             ctx = multiprocessing.get_context("spawn")
