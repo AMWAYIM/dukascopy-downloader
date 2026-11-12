@@ -4,7 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from core.services.data_migration import merge_metadata_ledgers
+from core.services.data_migration import merge_metadata_ledgers, rebuild_metadata_ledger
+from storage.tick_format import write_hour_file
 
 _SCHEMA = """
 CREATE TABLE hour_status (
@@ -220,6 +221,71 @@ class MergeMetadataLedgersTests(unittest.TestCase):
             merge_metadata_ledgers(dst, []),
             {"hour_rows": 0, "mt5_rows": 0, "path_rewrites": 0},
         )
+
+
+class RebuildMetadataLedgerTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._dir = Path(self._tmp.name)
+        self._tree = self._dir / "tree"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write_hour(self, symbol, year, month, day, hour, ticks):
+        path = self._tree / symbol / f"{year:04d}" / f"{month:02d}" / f"{day:02d}" / f"{hour:02d}.bin"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_hour_file(path, list(range(ticks)), [1.0] * ticks, [1.1] * ticks)
+        return path
+
+    def test_rebuild_writes_completed_rows(self):
+        p1 = self._write_hour("EURUSD", 2025, 1, 2, 14, 120)
+        self._write_hour("EURUSD", 2025, 1, 2, 15, 80)
+        self._write_hour("GBPUSD", 2024, 12, 31, 23, 5)
+        self._write_hour("GBPUSD", 2024, 12, 31, 22, 0)  # empty hour file
+        out = self._dir / "rebuilt.db"
+
+        n = rebuild_metadata_ledger(self._tree, out)
+        self.assertEqual(n, 4)
+
+        conn = sqlite3.connect(str(out))
+        try:
+            rows = conn.execute(
+                "SELECT instrument, hour_utc, status, tick_count, file_path "
+                "FROM hour_status ORDER BY instrument, hour_utc"
+            ).fetchall()
+            self.assertEqual(len(rows), 4)
+            self.assertEqual(
+                rows[0],
+                ("EURUSD", "2025-01-02T14:00:00", "completed", 120, str(p1)),
+            )
+            statuses = {r[2] for r in rows}
+            self.assertEqual(statuses, {"completed"})
+            # A zero-tick file is still a completed (empty) hour with count 0.
+            empty = [r for r in rows if r[1] == "2024-12-31T22:00:00"][0]
+            self.assertEqual(empty[3], 0)
+            self.assertTrue(conn.execute("SELECT COUNT(*) FROM mt5_custom_symbol").fetchone()[0] == 0)
+        finally:
+            conn.close()
+
+    def test_rebuild_ignores_stray_files(self):
+        self._write_hour("EURUSD", 2025, 1, 2, 14, 10)
+        stray = self._tree / "EURUSD" / "notes.txt"
+        stray.parent.mkdir(parents=True, exist_ok=True)
+        stray.write_text("noise", encoding="utf-8")
+        deep = self._tree / "EURUSD" / "2025" / "01" / "02" / "14" / "extra.bin"
+        deep.parent.mkdir(parents=True, exist_ok=True)
+        deep.write_bytes(b"\x00" * 8)
+        badhour = self._tree / "EURUSD" / "2025" / "01" / "02" / "99.bin"
+        badhour.parent.mkdir(parents=True, exist_ok=True)
+        write_hour_file(badhour, [1], [1.0], [1.1])
+
+        n = rebuild_metadata_ledger(self._tree, self._dir / "rebuilt.db")
+        self.assertEqual(n, 1)  # only the valid hour file
+
+    def test_rebuild_empty_tree_returns_zero(self):
+        n = rebuild_metadata_ledger(self._tree, self._dir / "rebuilt.db")
+        self.assertEqual(n, 0)
 
 
 if __name__ == "__main__":

@@ -7,13 +7,18 @@ roots intact and can be re-run.
 """
 from __future__ import annotations
 
+import os
 import shutil
 import sqlite3
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from config.data_config import validate_data_dir
+from core.models.task import TaskStatus
 from storage.fast_delete import fast_remove_tree
+from storage.metadata_db import _SCHEMA
+from storage.tick_format import read_hour_tick_count
 
 # Transient artifacts never copied to the destination.
 _SKIP_NAMES = {".web.lock", ".write_probe"}
@@ -242,3 +247,70 @@ def merge_metadata_ledgers(
         "mt5_rows": total_mt5,
         "path_rewrites": rewritten,
     }
+
+
+def rebuild_metadata_ledger(
+    tree: Path, out_db: Path, *, skip_instruments: set[str] | None = None
+) -> int:
+    """Rebuild an ``hour_status`` ledger from a tree of bin_v1 hour files.
+
+    Scans ``<tree>/<SYMBOL>/<year>/<month>/<day>/<hour>.bin`` files, reads
+    each file's tick count from its 4-byte header, and writes one completed
+    row per file to `out_db` (created fresh with the ledger schema). Returns
+    the number of rows written.
+
+    This recovers completed-hour state for a data root whose original
+    ``metadata.db`` is unavailable (e.g. already deleted). Empty/failed hour
+    states are not reconstructable and are simply absent, so those hours will
+    be treated as not-yet-attempted. Pass ``skip_instruments`` (e.g. symbols
+    already present in the merge-base ledger) to exclude those instruments
+    from the scan.
+    """
+    skip = frozenset(skip_instruments or ())
+    conn = sqlite3.connect(str(out_db), timeout=30.0)
+    inserted = 0
+    try:
+        conn.executescript(_SCHEMA)
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        for dirpath, _dirnames, filenames in os.walk(tree):
+            rel = Path(dirpath).relative_to(tree)
+            parts = rel.parts
+            if len(parts) != 4:
+                continue
+            symbol, year, month, day = parts
+            if symbol in skip:
+                continue
+            try:
+                y, mo, d = int(year), int(month), int(day)
+            except ValueError:
+                continue
+            if not (2000 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31):
+                continue
+            for fn in filenames:
+                if not fn.endswith(".bin"):
+                    continue
+                try:
+                    h = int(fn[:-4])
+                except ValueError:
+                    continue
+                if not 0 <= h <= 23:
+                    continue
+                path = Path(dirpath) / fn
+                ticks = read_hour_tick_count(path)
+                hour_key = f"{y:04d}-{mo:02d}-{d:02d}T{h:02d}:00:00"
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO hour_status "
+                    "(instrument, hour_utc, status, tick_count, file_path, "
+                    "attempts, last_error, updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        symbol, hour_key, TaskStatus.COMPLETED.value, ticks,
+                        str(path), 1, None, now,
+                    ),
+                )
+                inserted += cur.rowcount
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+    return inserted

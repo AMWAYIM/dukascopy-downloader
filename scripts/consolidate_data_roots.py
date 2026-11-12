@@ -45,7 +45,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config.data_config import validate_data_dir
-from core.services.data_migration import merge_metadata_ledgers, migrate_data_dir
+from core.services.data_migration import (
+    merge_metadata_ledgers,
+    migrate_data_dir,
+    rebuild_metadata_ledger,
+)
 from storage.fast_delete import fast_remove_tree
 
 # Top-level names never copied from a secondary source (its ledger is merged,
@@ -145,6 +149,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="allow copying into a non-empty target (resume)")
     parser.add_argument("--delete-secondary", action="store_true",
                         help="delete each secondary source after its copy is verified")
+    parser.add_argument("--skip-secondary-copy", action="store_true",
+                        help="resume: secondaries already copied/verified; rebuild "
+                             "their ledgers from the target tree if the source is gone")
     parser.add_argument("--dry-run", action="store_true",
                         help="report planned counts without writing anything")
     args = parser.parse_args(argv)
@@ -154,7 +161,7 @@ def main(argv: list[str] | None = None) -> int:
     secondaries = [p.resolve() for p in args.secondary]
     _validate_disjoint(target, [primary, *secondaries])
     for r in [primary, *secondaries]:
-        if not r.is_dir():
+        if not r.is_dir() and not (r in secondaries and args.skip_secondary_copy):
             parser.error(f"source root not found: {r}")
 
     if args.dry_run:
@@ -186,32 +193,32 @@ def main(argv: list[str] | None = None) -> int:
         _checkpoint_db(r / "metadata.db")
 
     preserved_dbs: list[Path] = []
-    tmp_keep: Path | None = None
+    tmp_keep = Path(tempfile.mkdtemp(prefix="duke_consolidate_"))
     try:
         # 2. Copy secondaries first (skipping their ledger files). With
         #    --delete-secondary the source is removed right after its verified
-        #    copy, freeing space before the (larger) primary copy runs.
-        if args.delete_secondary:
-            tmp_keep = Path(tempfile.mkdtemp(prefix="duke_consolidate_"))
+        #    copy, freeing space before the (larger) primary copy runs. With
+        #    --skip-secondary-copy the secondaries are assumed already copied
+        #    (e.g. resume after an interrupted run) and are left untouched.
+        if not args.skip_secondary_copy:
             for idx, sec in enumerate(secondaries):
                 s_stats = _copy_tree_verified(sec, target, _SECONDARY_SKIP_TOP)
                 print(f"secondary copied: {sec} ({s_stats['files_copied']:,} files, "
                       f"{s_stats['bytes_copied']:,} bytes), verified")
-                db = sec / "metadata.db"
-                if db.is_file():
-                    keep = tmp_keep / f"src{idx}_metadata.db"
-                    shutil.copy2(db, keep)
-                    preserved_dbs.append(keep)
-                fast_remove_tree(sec)
-                print(f"secondary deleted after verified copy: {sec}")
-        else:
-            for sec in secondaries:
-                s_stats = _copy_tree_verified(sec, target, _SECONDARY_SKIP_TOP)
-                print(f"secondary copied: {sec} ({s_stats['files_copied']:,} files, "
-                      f"{s_stats['bytes_copied']:,} bytes), verified")
+                if args.delete_secondary:
+                    db = sec / "metadata.db"
+                    if db.is_file():
+                        keep = tmp_keep / f"src{idx}_metadata.db"
+                        shutil.copy2(db, keep)
+                        preserved_dbs.append(keep)
+                    fast_remove_tree(sec)
+                    print(f"secondary deleted after verified copy: {sec}")
 
         # 3. Copy the primary wholesale (includes its metadata.db = merge base).
-        p_stats = migrate_data_dir(primary, target, delete_source=False, force=args.force)
+        #    When any secondary has already populated the target, the primary
+        #    copy must tolerate a non-empty destination by design.
+        p_stats = migrate_data_dir(primary, target, delete_source=False,
+                                   force=args.force or bool(secondaries))
         print(f"primary copied : {p_stats['files_copied']:,} files "
               f"({p_stats['bytes_copied']:,} bytes), verified "
               f"{p_stats['files_verified']:,}")
@@ -222,11 +229,28 @@ def main(argv: list[str] | None = None) -> int:
 
         # 5. Union the secondary ledgers into the target and rewrite stored tick
         #    paths so exports/MT5 publish resolve inside the new root.
-        if args.delete_secondary:
-            src_dbs = preserved_dbs
-        else:
-            src_dbs = [sec / "metadata.db" for sec in secondaries
-                       if (sec / "metadata.db").is_file()]
+        src_dbs = list(preserved_dbs)
+        if args.skip_secondary_copy or not args.delete_secondary:
+            for idx, sec in enumerate(secondaries):
+                db = sec / "metadata.db"
+                if db.is_file():
+                    src_dbs.append(db)
+                elif args.skip_secondary_copy:
+                    rebuilt = tmp_keep / f"src{idx}_rebuilt.db"
+                    # Only rebuild symbols not already owned by the merge base
+                    # (the primary ledger), so H: files in the target are not
+                    # re-scanned unnecessarily.
+                    base_instruments = {
+                        r[0]
+                        for r in sqlite3.connect(str(target / "metadata.db")).execute(
+                            "SELECT DISTINCT instrument FROM hour_status"
+                        )
+                    }
+                    n = rebuild_metadata_ledger(
+                        target, rebuilt, skip_instruments=base_instruments
+                    )
+                    print(f"secondary ledger rebuilt from target: {sec} ({n:,} rows)")
+                    src_dbs.append(rebuilt)
         rewrites = [(str(primary), str(target))] + [
             (str(sec), str(target)) for sec in secondaries
         ]
@@ -236,8 +260,7 @@ def main(argv: list[str] | None = None) -> int:
               f"{merged['mt5_rows']:,} mt5 symbol rows imported; "
               f"{merged['path_rewrites']:,} file paths rewritten")
     finally:
-        if tmp_keep is not None:
-            shutil.rmtree(tmp_keep, ignore_errors=True)
+        shutil.rmtree(tmp_keep, ignore_errors=True)
 
     return 0
 
