@@ -22,8 +22,11 @@ Semantics:
 - The secondary ledgers are unioned into the target `metadata.db` with
   `INSERT OR IGNORE` (never overwrites/downgrades existing rows), then every
   stored tick path under the old roots is rewritten to the target root.
-- Originals are never deleted. Re-runnable: pass `--force` to copy into a
-  partially-filled target (e.g. after an interrupted run).
+- Originals are kept by default. Pass `--delete-secondary` to remove each
+  secondary source right after its copy is verified (its ledger is preserved
+  for the merge and deleted afterwards), which frees space before the primary
+  copy runs. Re-runnable: pass `--force` to copy into a partially-filled
+  target (e.g. after an interrupted run).
 
 Stop the web server before running.
 """
@@ -34,6 +37,7 @@ import os
 import shutil
 import sqlite3
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -42,6 +46,7 @@ if str(ROOT) not in sys.path:
 
 from config.data_config import validate_data_dir
 from core.services.data_migration import merge_metadata_ledgers, migrate_data_dir
+from storage.fast_delete import fast_remove_tree
 
 # Top-level names never copied from a secondary source (its ledger is merged,
 # not copied).
@@ -138,6 +143,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="secondary source (tree-copied, ledger merged)")
     parser.add_argument("--force", action="store_true",
                         help="allow copying into a non-empty target (resume)")
+    parser.add_argument("--delete-secondary", action="store_true",
+                        help="delete each secondary source after its copy is verified")
     parser.add_argument("--dry-run", action="store_true",
                         help="report planned counts without writing anything")
     args = parser.parse_args(argv)
@@ -163,6 +170,8 @@ def main(argv: list[str] | None = None) -> int:
         for sec in secondaries:
             f, b = _count_files(sec, _SECONDARY_SKIP_TOP)
             print(f"secondary  : {sec} ({f:,} files, {b:,} bytes)")
+        if args.delete_secondary:
+            print("delete     : each secondary source will be removed after its copy is verified")
         print(f"estimated  : {p_files + s_files:,} files, {p_bytes + s_bytes:,} bytes in {target}")
         print("merge base : " + str(target / "metadata.db") + " (from primary)")
         print("rewrites   : " + "; ".join(f"{old} -> {target}" for old in [primary, *secondaries]))
@@ -176,32 +185,59 @@ def main(argv: list[str] | None = None) -> int:
     for r in [primary, *secondaries]:
         _checkpoint_db(r / "metadata.db")
 
-    # 2. Copy the primary wholesale (includes its metadata.db = merge base).
-    p_stats = migrate_data_dir(primary, target, delete_source=False, force=args.force)
-    print(f"primary copied : {p_stats['files_copied']:,} files "
-          f"({p_stats['bytes_copied']:,} bytes), verified "
-          f"{p_stats['files_verified']:,}")
+    preserved_dbs: list[Path] = []
+    tmp_keep: Path | None = None
+    try:
+        # 2. Copy secondaries first (skipping their ledger files). With
+        #    --delete-secondary the source is removed right after its verified
+        #    copy, freeing space before the (larger) primary copy runs.
+        if args.delete_secondary:
+            tmp_keep = Path(tempfile.mkdtemp(prefix="duke_consolidate_"))
+            for idx, sec in enumerate(secondaries):
+                s_stats = _copy_tree_verified(sec, target, _SECONDARY_SKIP_TOP)
+                print(f"secondary copied: {sec} ({s_stats['files_copied']:,} files, "
+                      f"{s_stats['bytes_copied']:,} bytes), verified")
+                db = sec / "metadata.db"
+                if db.is_file():
+                    keep = tmp_keep / f"src{idx}_metadata.db"
+                    shutil.copy2(db, keep)
+                    preserved_dbs.append(keep)
+                fast_remove_tree(sec)
+                print(f"secondary deleted after verified copy: {sec}")
+        else:
+            for sec in secondaries:
+                s_stats = _copy_tree_verified(sec, target, _SECONDARY_SKIP_TOP)
+                print(f"secondary copied: {sec} ({s_stats['files_copied']:,} files, "
+                      f"{s_stats['bytes_copied']:,} bytes), verified")
 
-    # 3. Copy secondaries, skipping their ledger/sidecar/artifact files.
-    for sec in secondaries:
-        s_stats = _copy_tree_verified(sec, target, _SECONDARY_SKIP_TOP)
-        print(f"secondary copied: {sec} ({s_stats['files_copied']:,} files, "
-              f"{s_stats['bytes_copied']:,} bytes), verified")
+        # 3. Copy the primary wholesale (includes its metadata.db = merge base).
+        p_stats = migrate_data_dir(primary, target, delete_source=False, force=args.force)
+        print(f"primary copied : {p_stats['files_copied']:,} files "
+              f"({p_stats['bytes_copied']:,} bytes), verified "
+              f"{p_stats['files_verified']:,}")
 
-    # 4. Drop any stale SQLite sidecars that came along with the primary copy.
-    for side in ("metadata.db-wal", "metadata.db-shm"):
-        (target / side).unlink(missing_ok=True)
+        # 4. Drop any stale SQLite sidecars that came along with the primary copy.
+        for side in ("metadata.db-wal", "metadata.db-shm"):
+            (target / side).unlink(missing_ok=True)
 
-    # 5. Union the secondary ledgers into the target and rewrite stored tick
-    #    paths so exports/MT5 publish resolve inside the new root.
-    src_dbs = [sec / "metadata.db" for sec in secondaries if (sec / "metadata.db").is_file()]
-    rewrites = [(str(primary), str(target))] + [
-        (str(sec), str(target)) for sec in secondaries
-    ]
-    merged = merge_metadata_ledgers(target / "metadata.db", src_dbs, path_rewrites=rewrites)
-    print(f"merged ledger : {merged['hour_rows']:,} hour rows, "
-          f"{merged['mt5_rows']:,} mt5 symbol rows imported; "
-          f"{merged['path_rewrites']:,} file paths rewritten")
+        # 5. Union the secondary ledgers into the target and rewrite stored tick
+        #    paths so exports/MT5 publish resolve inside the new root.
+        if args.delete_secondary:
+            src_dbs = preserved_dbs
+        else:
+            src_dbs = [sec / "metadata.db" for sec in secondaries
+                       if (sec / "metadata.db").is_file()]
+        rewrites = [(str(primary), str(target))] + [
+            (str(sec), str(target)) for sec in secondaries
+        ]
+        merged = merge_metadata_ledgers(target / "metadata.db", src_dbs,
+                                        path_rewrites=rewrites)
+        print(f"merged ledger : {merged['hour_rows']:,} hour rows, "
+              f"{merged['mt5_rows']:,} mt5 symbol rows imported; "
+              f"{merged['path_rewrites']:,} file paths rewritten")
+    finally:
+        if tmp_keep is not None:
+            shutil.rmtree(tmp_keep, ignore_errors=True)
 
     return 0
 
