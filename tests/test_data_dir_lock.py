@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from cli.commands import _acquire_data_dir_lock, is_data_dir_locked
+from cli.commands import _acquire_data_dir_lock, _read_lock_holder_pid, is_data_dir_locked
 
 
 def _hold_lock_in_child(data_dir: str, ready: "multiprocessing.Queue", done: "multiprocessing.Queue") -> None:
@@ -61,6 +61,19 @@ class DataDirLockProbeTests(unittest.TestCase):
             after = _acquire_data_dir_lock(Path(tmp))
             self.assertIsNotNone(after, "lock must be free again after the holder releases")
             after.close()
+
+    def test_read_lock_holder_pid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / ".web.lock").write_bytes(b"\n1234")
+            self.assertEqual(_read_lock_holder_pid(Path(tmp)), 1234)
+
+    def test_read_lock_holder_pid_absent_or_garbage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(_read_lock_holder_pid(Path(tmp)))
+            (Path(tmp) / ".web.lock").write_bytes(b"not-a-pid")
+            self.assertIsNone(_read_lock_holder_pid(Path(tmp)))
+            (Path(tmp) / ".web.lock").write_bytes(b"\n99extra\n")
+            self.assertIsNone(_read_lock_holder_pid(Path(tmp)))
 
     def test_held_lock_in_child_process_reports_locked(self):
         with tempfile.TemporaryDirectory() as tmp:

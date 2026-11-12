@@ -681,6 +681,26 @@ def _acquire_data_dir_lock(data_dir) -> object | None:
     return handle
 
 
+def _read_lock_holder_pid(data_dir) -> int | None:
+    """Best-effort read of the holder PID from .web.lock (offset 1).
+
+    Windows mandatory locks can refuse the read outright (None); where the
+    read succeeds, the leading newline means byte 0 is skipped. Garbage or
+    a missing file also yield None — the caller falls back to the generic
+    message.
+    """
+    from pathlib import Path
+
+    lock_path = Path(data_dir) / ".web.lock"
+    try:
+        with open(lock_path, "rb") as handle:
+            handle.seek(1)
+            pid_bytes = handle.read(32).split(b"\n", 1)[0].strip()
+        return int(pid_bytes) if pid_bytes else None
+    except (OSError, ValueError):
+        return None
+
+
 def is_data_dir_locked(data_dir) -> bool:
     """Non-destructive probe: True when a web server currently holds the lock.
 
@@ -745,11 +765,12 @@ def cmd_web(args) -> int:
     settings = _Settings()
     lock_handle = _acquire_data_dir_lock(settings.data_dir)
     if lock_handle is None:
-        # Note: the lock file can't be read while held, so no holder PID.
+        holder = _read_lock_holder_pid(settings.data_dir)
+        holder_txt = f" (PID {holder})" if holder else ""
         print(
             f"error: another web server is already using this data directory "
-            f"({settings.data_dir}). Stop it first - running two servers "
-            f"corrupts job state and locks the database.",
+            f"({settings.data_dir}){holder_txt}. Stop it first - running two "
+            f"servers corrupts job state and locks the database.",
             file=sys.stderr,
         )
         return 1
