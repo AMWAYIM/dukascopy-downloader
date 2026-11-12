@@ -8,6 +8,8 @@ roots intact and can be re-run.
 from __future__ import annotations
 
 import shutil
+import sqlite3
+import sys
 from pathlib import Path
 
 from config.data_config import validate_data_dir
@@ -84,4 +86,159 @@ def migrate_data_dir(
         "bytes_copied": total_bytes,
         "files_verified": len(source_files),
         "source_deleted": source_deleted,
+    }
+
+
+# Tables in the metadata ledger that are unioned across data roots. The column
+# list must match `storage/metadata_db.py`'s `_SCHEMA` exactly.
+_LEDGER_TABLES = ("hour_status", "mt5_custom_symbol")
+
+_LEDGER_HOUR_COLUMNS = (
+    "instrument", "hour_utc", "status", "tick_count", "file_path",
+    "attempts", "last_error", "updated_at",
+)
+_LEDGER_MT5_COLUMNS = (
+    "symbol", "source_symbol", "ticks", "first_ms", "last_ms",
+    "range_label", "imported_at", "synced_at",
+)
+
+
+def _table_columns(
+    conn: sqlite3.Connection, table: str, attach: str | None = None
+) -> list[tuple]:
+    """Full column definitions of `table`, optionally in an attached schema."""
+    schema = f"{attach}." if attach else ""
+    return conn.execute(f"PRAGMA {schema}table_info({table})").fetchall()
+
+
+def merge_metadata_ledgers(
+    dst_db: Path,
+    src_dbs: list[Path],
+    *,
+    path_rewrites: list[tuple[str, str]] | None = None,
+) -> dict:
+    """Union the metadata ledgers of `src_dbs` into `dst_db`.
+
+    The destination database is the base ledger (typically the freshest root).
+    Rows are imported with ``INSERT OR IGNORE``, so an existing primary key —
+    including a completed hour — is never overwritten or downgraded. After
+    importing, ``hour_status.file_path`` values matching any ``(old, new)``
+    prefix pair are rewritten in order (each old prefix is replaced once).
+    The destination is WAL-checkpointed before returning, so the result is a
+    self-contained ``metadata.db`` with no sidecar files.
+
+    Returns ``{"hour_rows": int, "mt5_rows": int, "path_rewrites": int}``.
+
+    Raises ValueError when a source is missing, has a schema that differs from
+    the destination, or contributes no rows at all.
+    """
+    if not dst_db.is_file():
+        raise ValueError(f"destination database not found: {dst_db}")
+    if not src_dbs:
+        return {"hour_rows": 0, "mt5_rows": 0, "path_rewrites": 0}
+
+    conn = sqlite3.connect(str(dst_db), timeout=30.0)
+    try:
+        dst_cols = {t: _table_columns(conn, t) for t in _LEDGER_TABLES}
+        total_hour = 0
+        total_mt5 = 0
+
+        for idx, src in enumerate(src_dbs):
+            src = Path(src)
+            if not src.is_file():
+                raise ValueError(f"source database not found: {src}")
+            attach = f"src{idx}"
+            conn.execute(f"ATTACH DATABASE ? AS {attach}", (str(src),))
+            try:
+                for table in _LEDGER_TABLES:
+                    col_defs = _table_columns(conn, table, attach=attach)
+                    if col_defs != dst_cols[table]:
+                        raise ValueError(
+                            f"schema mismatch in {src} for {table}: "
+                            f"expected {dst_cols[table]}, got {col_defs}"
+                        )
+
+                overlap = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT DISTINCT instrument FROM hour_status "
+                        f"INTERSECT SELECT DISTINCT instrument FROM {attach}.hour_status"
+                    )
+                ]
+                if overlap:
+                    shown = ", ".join(sorted(overlap)[:10])
+                    extra = " …" if len(overlap) > 10 else ""
+                    print(
+                        "warning: overlapping instruments between "
+                        f"{dst_db} and {src}: {shown}{extra} "
+                        "(destination rows win)",
+                        file=sys.stderr,
+                    )
+
+                cur = conn.execute(
+                    f"""
+                    INSERT OR IGNORE INTO hour_status
+                        ({", ".join(_LEDGER_HOUR_COLUMNS)})
+                    SELECT {", ".join(_LEDGER_HOUR_COLUMNS)}
+                    FROM {attach}.hour_status
+                    """
+                )
+                hour_added = cur.rowcount
+                cur = conn.execute(
+                    f"""
+                    INSERT OR IGNORE INTO mt5_custom_symbol
+                        ({", ".join(_LEDGER_MT5_COLUMNS)})
+                    SELECT {", ".join(_LEDGER_MT5_COLUMNS)}
+                    FROM {attach}.mt5_custom_symbol
+                    """
+                )
+                mt5_added = cur.rowcount
+                if hour_added == 0 and mt5_added == 0:
+                    raise ValueError(f"source contributed no rows: {src}")
+                total_hour += hour_added
+                total_mt5 += mt5_added
+                # Commit before detaching: SQLite refuses to DETACH a
+                # database that is in use by an open write transaction.
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+            finally:
+                try:
+                    conn.execute(f"DETACH DATABASE {attach}")
+                except sqlite3.OperationalError:
+                    # Non-critical: the connection close cleans up the schema.
+                    pass
+
+        rewritten = 0
+        for old, new in path_rewrites or []:
+            if not old or not new or old == new:
+                continue
+            pattern = old + "%"
+            before = conn.execute(
+                "SELECT COUNT(*) FROM hour_status WHERE file_path LIKE ?",
+                (pattern,),
+            ).fetchone()[0]
+            if before == 0:
+                continue
+            conn.execute(
+                "UPDATE hour_status SET file_path = REPLACE(file_path, ?, ?) "
+                "WHERE file_path LIKE ?",
+                (old, new, pattern),
+            )
+            after = conn.execute(
+                "SELECT COUNT(*) FROM hour_status WHERE file_path LIKE ?",
+                (pattern,),
+            ).fetchone()[0]
+            rewritten += before - after
+
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+
+    return {
+        "hour_rows": total_hour,
+        "mt5_rows": total_mt5,
+        "path_rewrites": rewritten,
     }
