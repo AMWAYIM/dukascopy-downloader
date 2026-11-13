@@ -48,6 +48,7 @@ _import_lock = threading.Lock()
 _active_terminal: dict[str, Path] = {}
 IMPORT_TIMEOUT_SEC = 6 * 3600
 MT5_STARTUP_TIMEOUT_SEC = 120
+MT5_PS_TIMEOUT_SEC = 10
 # MT5 can intermittently fail to open a file after a very large Common\Files
 # job folder.  Keep each script run below that practical limit and append the
 # batches into the same custom symbol.
@@ -975,12 +976,18 @@ def kill_mt5_terminal(terminal_exe: Path) -> None:
         "Where-Object { $_.Path -and ($_.Path -ieq $target) } | "
         "Stop-Process -Force -ErrorAction SilentlyContinue"
     )
-    subprocess.run(
-        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-        capture_output=True,
-        timeout=10,
-        check=False,
-    )
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            timeout=MT5_PS_TIMEOUT_SEC,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        logging.getLogger(__name__).warning(
+            "MT5 terminal stop timed out after %ss (best-effort) — continuing",
+            MT5_PS_TIMEOUT_SEC,
+        )
 
 
 def is_mt5_running(terminal_exe: Path) -> bool:
@@ -997,7 +1004,7 @@ def is_mt5_running(terminal_exe: Path) -> bool:
     result = subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
         capture_output=True,
-        timeout=10,
+        timeout=MT5_PS_TIMEOUT_SEC,
         check=False,
     )
     return result.returncode == 0
@@ -1573,7 +1580,7 @@ def list_terminal_processes() -> list[dict[str, Any]]:
     try:
         result = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-            capture_output=True, text=True, timeout=10, check=False,
+            capture_output=True, text=True, timeout=MT5_PS_TIMEOUT_SEC, check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return []
