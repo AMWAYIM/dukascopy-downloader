@@ -89,8 +89,8 @@ class GapScanner:
                 report.failed_hours.append(cursor)
             else:
                 report.missing_count += 1
-                if len(report.missing_hours) < _GAP_SAMPLE_LIMIT:
-                    report.missing_hours.append(cursor)
+                # Missing hours feed repair tasks; do NOT sample them.
+                report.missing_hours.append(cursor)
             cursor += _HOUR
         return report
 
@@ -113,8 +113,8 @@ class GapScanner:
                 report.failed_hours.append(hour)
             else:
                 report.missing_count += 1
-                if len(report.missing_hours) < _GAP_SAMPLE_LIMIT:
-                    report.missing_hours.append(hour)
+                # Missing hours feed repair tasks; do NOT sample them.
+                report.missing_hours.append(hour)
         return report
 
     def build_repair_tasks(

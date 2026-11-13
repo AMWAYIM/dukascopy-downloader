@@ -71,7 +71,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     p_gaps = sub.add_parser("gaps", help="report (and optionally repair) missing hours")
-    p_gaps.add_argument("symbol")
+    p_gaps.add_argument("symbol", nargs="?")
     p_gaps.add_argument(
         "start",
         nargs="?",
@@ -98,6 +98,20 @@ def _build_parser() -> argparse.ArgumentParser:
         "--refetch-empty",
         action="store_true",
         help="with --repair, also re-request hours already marked empty",
+    )
+    p_gaps.add_argument(
+        "--all-symbols",
+        action="store_true",
+        help="scan (and optionally repair) every recorded symbol; "
+             "overrides SYMBOL/start/end",
+    )
+    p_gaps.add_argument(
+        "--max-passes", type=int, default=5,
+        help="with --repair --all-symbols, scan+repair passes per symbol (default 5)",
+    )
+    p_gaps.add_argument(
+        "--limit", type=int, default=None,
+        help="with --repair --all-symbols, only repair the first N incomplete symbols",
     )
 
     p_status = sub.add_parser("status", help="show stored data summary for an instrument")
@@ -251,7 +265,99 @@ def cmd_download(settings: Settings, catalog: InstrumentCatalog, args) -> int:
     return 0
 
 
+def _gaps_report_line(instrument: Instrument, report) -> str:
+    return (
+        f"{instrument.symbol:<16} {report.total_hours:>7} total, "
+        f"{report.completed:>7} data, {report.empty:>6} empty, "
+        f"{len(report.failed_hours):>5} failed, "
+        f"{report.missing_count:>7} never attempted"
+    )
+
+
+def cmd_gaps_all_symbols(settings: Settings, catalog: InstrumentCatalog, args) -> int:
+    """Scan every recorded symbol; with --repair, loop until each is complete."""
+    db = MetadataDB(settings.db_path)
+    scanner = GapScanner(settings, db)
+    symbols = sorted(db.list_instruments())
+    if not symbols:
+        print("No symbols recorded yet.")
+        return 0
+
+    if args.repair:
+        _warn_if_web_running(settings)
+
+    incomplete: list[Instrument] = []
+    for sid in symbols:
+        inst = catalog.get(sid.upper())
+        if inst is None:
+            print(f"  {sid}: not in catalog — skipped")
+            continue
+        report = scanner.scan_all(inst)
+        if report is None:
+            print(f"  {sid}: no data recorded")
+            continue
+        print(_gaps_report_line(inst, report))
+        if not report.is_complete:
+            incomplete.append(inst)
+
+    if not args.repair:
+        if incomplete:
+            print(f"\n{len(incomplete)} symbol(s) have gaps; run with --repair to fix.")
+            return 1
+        print("\nAll symbols complete.")
+        return 0
+
+    targets = incomplete if args.limit is None else incomplete[: args.limit]
+    if not targets:
+        print("\nNothing to repair — all symbols complete.")
+        return 0
+    if len(targets) < len(incomplete):
+        print(f"\n--limit {args.limit}: repairing {len(targets)} of "
+              f"{len(incomplete)} incomplete symbol(s).")
+
+    print(f"\nRepairing {len(targets)} symbol(s) (max {args.max_passes} passes each)...")
+    bad: list[str] = []
+    for inst in targets:
+        passed = 0
+        while passed < args.max_passes:
+            passed += 1
+            report = scanner.scan_all(inst)
+            if report is None or report.is_complete:
+                break
+            tasks = scanner.build_repair_tasks(
+                inst, report, refetch_empty=args.refetch_empty
+            )
+            if not tasks:
+                break
+            local_settings = settings.for_job(args.workers)
+            storage = TickStorage(settings.data_dir)
+            engine = DownloadEngine(local_settings, storage, db)
+            stats = engine.run(tasks, on_task_done=None, refetch=True)
+            print(f"  {inst.symbol} pass {passed}: {stats.completed} data, "
+                  f"{stats.empty} empty, {stats.failed} failed")
+        final = scanner.scan_all(inst)
+        ok = final is not None and final.is_complete
+        print(f"  {inst.symbol}: {'COMPLETE' if ok else 'STILL INCOMPLETE'} "
+              f"after {passed} pass(es)")
+        if not ok:
+            bad.append(inst.symbol)
+
+    if bad:
+        print(f"\nStill incomplete after max passes: {', '.join(bad)}")
+        print("Re-run with a higher --max-passes, or inspect individual symbols via")
+        print("  python main.py gaps <SYMBOL> --all --repair")
+        return 1
+    print("\nAll target symbols complete.")
+    return 0
+
+
 def cmd_gaps(settings: Settings, catalog: InstrumentCatalog, args) -> int:
+    if args.all_symbols:
+        if args.start or args.end:
+            raise SystemExit("error: --all-symbols cannot be combined with start/end dates")
+        return cmd_gaps_all_symbols(settings, catalog, args)
+    if args.symbol is None:
+        raise SystemExit("error: SYMBOL is required (or use --all-symbols)")
     instrument = catalog.get(args.symbol)
     if args.all and (args.start or args.end):
         raise SystemExit("error: --all cannot be combined with start/end dates")
