@@ -272,12 +272,12 @@ def main(argv: list[str] | None = None) -> int:
             target / "metadata.db", src_dbs,
             path_rewrites=rewrites, drop_missing=True,
         )
-        # Some roots keep lowercase instrument ids in the ledger while disk
-        # dirs (and the catalog) are uppercase; fold any such duplicates into
-        # the canonical uppercase form before finishing.
+        # The app keys ledger queries on lowercase instrument ids; fold any
+        # mixed-case duplicates (e.g. from a root whose ledger used uppercase)
+        # into the canonical lowercase form before finishing.
         normalized = normalize_instrument_case(target / "metadata.db")
         if normalized:
-            print(f"instrument case normalized : {normalized:,} rows folded to uppercase")
+            print(f"instrument case normalized : {normalized:,} rows folded to lowercase")
         print(f"merged ledger : {merged['hour_rows']:,} hour rows, "
               f"{merged['mt5_rows']:,} mt5 symbol rows imported; "
               f"{merged['path_rewrites']:,} file paths rewritten; "

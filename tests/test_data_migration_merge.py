@@ -331,16 +331,16 @@ class NormalizeInstrumentCaseTests(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def test_folds_lowercase_into_uppercase_preserving_empty_rows(self):
+    def test_folds_uppercase_into_lowercase_preserving_empty_rows(self):
         db = self._dir / "ledger.db"
-        # Mixed case: same file hour exists in both cases; the lowercase set
-        # also carries a null-path (empty/failed) row not present in uppercase.
+        # Mixed case: same file hour exists in both cases; the uppercase set
+        # also carries a null-path (empty/failed) row not present in lowercase.
         _build_db(
             db,
             hours=[
-                _hour("EURUSD", "2026-01-01T10:00:00", file_path=r"C:\data\EURUSD\2026\01\01\10.bin"),
                 _hour("eurusd", "2026-01-01T10:00:00", file_path=r"C:\data\EURUSD\2026\01\01\10.bin"),
-                _hour("eurusd", "2026-01-01T11:00:00", status="empty", tick_count=0, file_path=None),
+                _hour("EURUSD", "2026-01-01T10:00:00", file_path=r"C:\data\EURUSD\2026\01\01\10.bin"),
+                _hour("EURUSD", "2026-01-01T11:00:00", status="empty", tick_count=0, file_path=None),
             ],
         )
 
@@ -353,17 +353,17 @@ class NormalizeInstrumentCaseTests(unittest.TestCase):
                 "SELECT instrument, hour_utc, status, tick_count, file_path "
                 "FROM hour_status ORDER BY hour_utc"
             ).fetchall()
-            self.assertEqual([r[0] for r in rows], ["EURUSD", "EURUSD"])
-            self.assertTrue(all(r[0] == r[0].upper() for r in rows))
-            # Both the file hour and the empty hour survive under uppercase.
+            self.assertEqual([r[0] for r in rows], ["eurusd", "eurusd"])
+            self.assertTrue(all(r[0] == r[0].lower() for r in rows))
+            # Both the file hour and the empty hour survive under lowercase.
             keys = {r[1] for r in rows}
             self.assertEqual(keys, {"2026-01-01T10:00:00", "2026-01-01T11:00:00"})
         finally:
             conn.close()
 
-    def test_already_uppercase_is_noop(self):
+    def test_already_lowercase_is_noop(self):
         db = self._dir / "ledger.db"
-        _build_db(db, hours=[_hour("EURUSD", "2026-01-01T10:00:00")])
+        _build_db(db, hours=[_hour("eurusd", "2026-01-01T10:00:00")])
         self.assertEqual(normalize_instrument_case(db), 0)
 
 

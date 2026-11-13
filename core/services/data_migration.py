@@ -282,29 +282,29 @@ def merge_metadata_ledgers(
 
 
 def normalize_instrument_case(db_path: Path) -> int:
-    """Collapse mixed-case instrument rows to uppercase in a ledger.
+    """Collapse mixed-case instrument rows to lowercase in a ledger.
 
-    Some roots store instrument ids in lowercase in ``hour_status`` while the
-    on-disk symbol directories (and the app's instrument catalog) are
-    uppercase. A merge can then end up with the same instrument twice (e.g.
-    ``deuidxeur`` and ``DEUIDXEUR``). This folds every lowercase row into its
-    uppercase counterpart — inserting rows whose ``(instrument, hour_utc)``
-    key is not already present (preserving empty/failed null-path records)
-    and deleting the lowercase originals. Returns the number of lowercase
-    rows deleted.
+    The app keys every ledger query on ``Instrument.id``, which is lowercase
+    (e.g. ``eurusd``), while the on-disk symbol directories are uppercase. A
+    merge of roots whose ledgers disagree on case can therefore end up with
+    the same instrument twice (e.g. ``deuidxeur`` and ``DEUIDXEUR``). This
+    folds every uppercase row into its lowercase counterpart — inserting rows
+    whose ``(instrument, hour_utc)`` key is not already present (preserving
+    empty/failed null-path records) and deleting the uppercase originals.
+    Returns the number of non-canonical rows deleted.
     """
     conn = sqlite3.connect(str(db_path), timeout=30.0)
     deleted = 0
     try:
-        lower_instruments = [
+        noncanonical = [
             r[0]
             for r in conn.execute(
                 "SELECT DISTINCT instrument FROM hour_status "
-                "WHERE instrument != upper(instrument)"
+                "WHERE instrument != lower(instrument)"
             )
         ]
-        for inst in lower_instruments:
-            up = inst.upper()
+        for inst in noncanonical:
+            low = inst.lower()
             conn.execute(
                 "INSERT OR IGNORE INTO hour_status "
                 "(instrument, hour_utc, status, tick_count, file_path, "
@@ -312,11 +312,11 @@ def normalize_instrument_case(db_path: Path) -> int:
                 "SELECT ?, hour_utc, status, tick_count, file_path, "
                 "attempts, last_error, updated_at FROM hour_status "
                 "WHERE instrument=?",
-                (up, inst),
+                (low, inst),
             )
             cur = conn.execute("DELETE FROM hour_status WHERE instrument=?", (inst,))
             deleted += cur.rowcount
-        if lower_instruments:
+        if noncanonical:
             conn.commit()
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     finally:
