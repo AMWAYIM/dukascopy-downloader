@@ -3,8 +3,13 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from core.services.data_migration import merge_metadata_ledgers, rebuild_metadata_ledger
+from core.services.data_migration import (
+    merge_metadata_ledgers,
+    migrate_data_dir,
+    rebuild_metadata_ledger,
+)
 from storage.tick_format import write_hour_file
 
 _SCHEMA = """
@@ -219,8 +224,102 @@ class MergeMetadataLedgersTests(unittest.TestCase):
         _build_db(dst, hours=[_hour("A", "2026-01-01T10:00:00")])
         self.assertEqual(
             merge_metadata_ledgers(dst, []),
-            {"hour_rows": 0, "mt5_rows": 0, "path_rewrites": 0},
+            {"hour_rows": 0, "mt5_rows": 0, "path_rewrites": 0,
+             "missing_dropped": 0},
         )
+
+    def test_drop_missing_deletes_rows_with_missing_files(self):
+        dst = self._dir / "dst.db"
+        existing = self._dir / "existing.bin"
+        existing.write_bytes(b"x" * 16)
+        # A row whose file path exists on disk, one whose file is missing,
+        # and one NULL file_path (empty hour — must be kept).
+        _build_db(
+            dst,
+            hours=[
+                _hour("A", "2026-01-01T10:00:00", file_path=str(existing)),
+                _hour("B", "2026-01-01T10:00:00", file_path=str(self._dir / "missing.bin")),
+                _hour("C", "2026-01-01T10:00:00", file_path=None),
+            ],
+        )
+
+        result = merge_metadata_ledgers(dst, [], drop_missing=True)
+        self.assertEqual(result["missing_dropped"], 1)
+
+        conn = sqlite3.connect(str(dst))
+        try:
+            remaining = conn.execute(
+                "SELECT instrument FROM hour_status ORDER BY instrument"
+            ).fetchall()
+            self.assertEqual([r[0] for r in remaining], ["A", "C"])
+        finally:
+            conn.close()
+
+    def test_drop_missing_default_false_keeps_missing(self):
+        dst = self._dir / "dst.db"
+        _build_db(
+            dst,
+            hours=[
+                _hour("B", "2026-01-01T10:00:00",
+                       file_path=str(self._dir / "missing.bin")),
+            ],
+        )
+        result = merge_metadata_ledgers(dst, [])
+        self.assertEqual(result["missing_dropped"], 0)
+        self.assertTrue(dst.is_file())
+
+
+class MigrateDataDirSkipErrorsTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._dir = Path(self._tmp.name)
+        self._src = self._dir / "src"
+        self._dst = self._dir / "dst"
+        self._src.mkdir()
+        self._dst.mkdir()
+        (self._src / "ok.bin").write_bytes(b"ok" * 8)
+        self._bad = self._src / "bad.bin"
+        self._bad.write_bytes(b"bad" * 8)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_skip_errors_skips_unreadable_file(self):
+        import os
+        import shutil as _shutil
+        import core.services.data_migration as dm
+
+        real_copy2 = _shutil.copy2
+
+        def _copy2(src, dst, *a, **k):
+            if os.path.basename(os.fspath(src)) == "bad.bin":
+                raise OSError("simulated unreadable sector")
+            return real_copy2(src, dst, *a, **k)
+
+        with mock.patch.object(dm.shutil, "copy2", side_effect=_copy2):
+            stats = migrate_data_dir(self._src, self._dst, skip_errors=True)
+
+        self.assertEqual(stats["files_copied"], 1)
+        self.assertEqual(stats["files_verified"], 1)
+        self.assertEqual(stats["skipped_files"], [str(self._bad)])
+        self.assertFalse((self._dst / "bad.bin").exists())
+        self.assertTrue((self._dst / "ok.bin").exists())
+
+    def test_without_skip_errors_raises(self):
+        import os
+        import shutil as _shutil
+        import core.services.data_migration as dm
+
+        real_copy2 = _shutil.copy2
+
+        def _copy2(src, dst, *a, **k):
+            if os.path.basename(os.fspath(src)) == "bad.bin":
+                raise OSError("simulated unreadable sector")
+            return real_copy2(src, dst, *a, **k)
+
+        with mock.patch.object(dm.shutil, "copy2", side_effect=_copy2):
+            with self.assertRaises(RuntimeError):
+                migrate_data_dir(self._src, self._dst)
 
 
 class RebuildMetadataLedgerTests(unittest.TestCase):

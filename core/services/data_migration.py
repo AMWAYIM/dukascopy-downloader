@@ -31,11 +31,14 @@ def migrate_data_dir(
     delete_source: bool = False,
     force: bool = False,
     on_progress: "callable[[int, int], None] | None" = None,
+    skip_errors: bool = False,
 ) -> dict:
     """Copy src → dst, verify, and optionally delete src.
 
     Raises ValueError for invalid arguments and RuntimeError when the
-    destination is unusable or verification fails.
+    destination is unusable or verification fails. When ``skip_errors`` is
+    true, files that fail to copy (e.g. unreadable sectors on a failing
+    drive) are skipped and reported in ``skipped_files`` instead of aborting.
     """
     src = src.resolve()
     dst = dst.resolve()
@@ -66,11 +69,15 @@ def migrate_data_dir(
         total_bytes += path.stat().st_size
 
     copied = 0
+    skipped: list[Path] = []
     for path, target in source_files:
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, target)
         except OSError as exc:
+            if skip_errors:
+                skipped.append(path)
+                continue
             raise RuntimeError(f"copy failed for {path}: {exc}") from exc
         copied += 1
         if on_progress is not None:
@@ -78,6 +85,8 @@ def migrate_data_dir(
 
     # Verify: every source file exists at the destination with the same size.
     for path, target in source_files:
+        if path in skipped:
+            continue
         if not target.is_file() or target.stat().st_size != path.stat().st_size:
             raise RuntimeError(f"verification failed for {target}")
 
@@ -89,7 +98,8 @@ def migrate_data_dir(
     return {
         "files_copied": copied,
         "bytes_copied": total_bytes,
-        "files_verified": len(source_files),
+        "files_verified": len(source_files) - len(skipped),
+        "skipped_files": [str(p) for p in skipped],
         "source_deleted": source_deleted,
     }
 
@@ -121,6 +131,7 @@ def merge_metadata_ledgers(
     src_dbs: list[Path],
     *,
     path_rewrites: list[tuple[str, str]] | None = None,
+    drop_missing: bool = False,
 ) -> dict:
     """Union the metadata ledgers of `src_dbs` into `dst_db`.
 
@@ -129,18 +140,20 @@ def merge_metadata_ledgers(
     including a completed hour — is never overwritten or downgraded. After
     importing, ``hour_status.file_path`` values matching any ``(old, new)``
     prefix pair are rewritten in order (each old prefix is replaced once).
+    When ``drop_missing`` is true, rows whose (rewritten) ``file_path`` does
+    not exist on disk are deleted afterwards, so those hours are re-downloaded
+    by a later ``gaps --repair`` run rather than left pointing at nothing.
     The destination is WAL-checkpointed before returning, so the result is a
     self-contained ``metadata.db`` with no sidecar files.
 
-    Returns ``{"hour_rows": int, "mt5_rows": int, "path_rewrites": int}``.
+    Returns ``{"hour_rows": int, "mt5_rows": int, "path_rewrites": int,
+    "missing_dropped": int}``.
 
     Raises ValueError when a source is missing, has a schema that differs from
     the destination, or contributes no rows at all.
     """
     if not dst_db.is_file():
         raise ValueError(f"destination database not found: {dst_db}")
-    if not src_dbs:
-        return {"hour_rows": 0, "mt5_rows": 0, "path_rewrites": 0}
 
     conn = sqlite3.connect(str(dst_db), timeout=30.0)
     try:
@@ -237,6 +250,24 @@ def merge_metadata_ledgers(
             ).fetchone()[0]
             rewritten += before - after
 
+        dropped = 0
+        if drop_missing:
+            rows = conn.execute(
+                "SELECT instrument, hour_utc, file_path FROM hour_status "
+                "WHERE file_path IS NOT NULL AND file_path != ''"
+            ).fetchall()
+            gone = [
+                (inst, key)
+                for inst, key, fp in rows
+                if not Path(fp).is_file()
+            ]
+            if gone:
+                conn.executemany(
+                    "DELETE FROM hour_status WHERE instrument=? AND hour_utc=?",
+                    gone,
+                )
+                dropped = len(gone)
+
         conn.commit()
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     finally:
@@ -246,6 +277,7 @@ def merge_metadata_ledgers(
         "hour_rows": total_hour,
         "mt5_rows": total_mt5,
         "path_rewrites": rewritten,
+        "missing_dropped": dropped,
     }
 
 

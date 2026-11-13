@@ -216,12 +216,25 @@ def main(argv: list[str] | None = None) -> int:
 
         # 3. Copy the primary wholesale (includes its metadata.db = merge base).
         #    When any secondary has already populated the target, the primary
-        #    copy must tolerate a non-empty destination by design.
+        #    copy must tolerate a non-empty destination by design. Unreadable
+        #    source files (e.g. bad sectors) are skipped, logged, and their
+        #    ledger rows dropped so gaps --repair re-downloads them.
+        primary_skip_log: list[str] = []
         p_stats = migrate_data_dir(primary, target, delete_source=False,
-                                   force=args.force or bool(secondaries))
+                                   force=args.force or bool(secondaries),
+                                   skip_errors=True)
+        if p_stats["skipped_files"]:
+            primary_skip_log = p_stats["skipped_files"]
         print(f"primary copied : {p_stats['files_copied']:,} files "
               f"({p_stats['bytes_copied']:,} bytes), verified "
               f"{p_stats['files_verified']:,}")
+        if primary_skip_log:
+            print(f"WARNING: {len(primary_skip_log):,} primary files were NOT copied "
+                  f"(unreadable):")
+            for sf in primary_skip_log[:20]:
+                print(f"  {sf}")
+            if len(primary_skip_log) > 20:
+                print(f"  … and {len(primary_skip_log) - 20:,} more")
 
         # 4. Drop any stale SQLite sidecars that came along with the primary copy.
         for side in ("metadata.db-wal", "metadata.db-shm"):
@@ -254,11 +267,17 @@ def main(argv: list[str] | None = None) -> int:
         rewrites = [(str(primary), str(target))] + [
             (str(sec), str(target)) for sec in secondaries
         ]
-        merged = merge_metadata_ledgers(target / "metadata.db", src_dbs,
-                                        path_rewrites=rewrites)
+        merged = merge_metadata_ledgers(
+            target / "metadata.db", src_dbs,
+            path_rewrites=rewrites, drop_missing=True,
+        )
         print(f"merged ledger : {merged['hour_rows']:,} hour rows, "
               f"{merged['mt5_rows']:,} mt5 symbol rows imported; "
-              f"{merged['path_rewrites']:,} file paths rewritten")
+              f"{merged['path_rewrites']:,} file paths rewritten; "
+              f"{merged['missing_dropped']:,} dropped (file missing on disk)")
+        if primary_skip_log:
+            print("Run after the move to re-download the dropped hours:")
+            print("  python main.py gaps <symbol> --all --repair")
     finally:
         shutil.rmtree(tmp_keep, ignore_errors=True)
 
