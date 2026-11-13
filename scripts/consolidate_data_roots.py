@@ -48,6 +48,7 @@ from config.data_config import validate_data_dir
 from core.services.data_migration import (
     merge_metadata_ledgers,
     migrate_data_dir,
+    normalize_instrument_case,
     rebuild_metadata_ledger,
 )
 from storage.fast_delete import fast_remove_tree
@@ -271,6 +272,12 @@ def main(argv: list[str] | None = None) -> int:
             target / "metadata.db", src_dbs,
             path_rewrites=rewrites, drop_missing=True,
         )
+        # Some roots keep lowercase instrument ids in the ledger while disk
+        # dirs (and the catalog) are uppercase; fold any such duplicates into
+        # the canonical uppercase form before finishing.
+        normalized = normalize_instrument_case(target / "metadata.db")
+        if normalized:
+            print(f"instrument case normalized : {normalized:,} rows folded to uppercase")
         print(f"merged ledger : {merged['hour_rows']:,} hour rows, "
               f"{merged['mt5_rows']:,} mt5 symbol rows imported; "
               f"{merged['path_rewrites']:,} file paths rewritten; "

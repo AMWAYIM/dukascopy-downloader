@@ -281,6 +281,49 @@ def merge_metadata_ledgers(
     }
 
 
+def normalize_instrument_case(db_path: Path) -> int:
+    """Collapse mixed-case instrument rows to uppercase in a ledger.
+
+    Some roots store instrument ids in lowercase in ``hour_status`` while the
+    on-disk symbol directories (and the app's instrument catalog) are
+    uppercase. A merge can then end up with the same instrument twice (e.g.
+    ``deuidxeur`` and ``DEUIDXEUR``). This folds every lowercase row into its
+    uppercase counterpart — inserting rows whose ``(instrument, hour_utc)``
+    key is not already present (preserving empty/failed null-path records)
+    and deleting the lowercase originals. Returns the number of lowercase
+    rows deleted.
+    """
+    conn = sqlite3.connect(str(db_path), timeout=30.0)
+    deleted = 0
+    try:
+        lower_instruments = [
+            r[0]
+            for r in conn.execute(
+                "SELECT DISTINCT instrument FROM hour_status "
+                "WHERE instrument != upper(instrument)"
+            )
+        ]
+        for inst in lower_instruments:
+            up = inst.upper()
+            conn.execute(
+                "INSERT OR IGNORE INTO hour_status "
+                "(instrument, hour_utc, status, tick_count, file_path, "
+                "attempts, last_error, updated_at) "
+                "SELECT ?, hour_utc, status, tick_count, file_path, "
+                "attempts, last_error, updated_at FROM hour_status "
+                "WHERE instrument=?",
+                (up, inst),
+            )
+            cur = conn.execute("DELETE FROM hour_status WHERE instrument=?", (inst,))
+            deleted += cur.rowcount
+        if lower_instruments:
+            conn.commit()
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+    return deleted
+
+
 def rebuild_metadata_ledger(
     tree: Path, out_db: Path, *, skip_instruments: set[str] | None = None
 ) -> int:

@@ -8,6 +8,7 @@ from unittest import mock
 from core.services.data_migration import (
     merge_metadata_ledgers,
     migrate_data_dir,
+    normalize_instrument_case,
     rebuild_metadata_ledger,
 )
 from storage.tick_format import write_hour_file
@@ -320,6 +321,50 @@ class MigrateDataDirSkipErrorsTests(unittest.TestCase):
         with mock.patch.object(dm.shutil, "copy2", side_effect=_copy2):
             with self.assertRaises(RuntimeError):
                 migrate_data_dir(self._src, self._dst)
+
+
+class NormalizeInstrumentCaseTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_folds_lowercase_into_uppercase_preserving_empty_rows(self):
+        db = self._dir / "ledger.db"
+        # Mixed case: same file hour exists in both cases; the lowercase set
+        # also carries a null-path (empty/failed) row not present in uppercase.
+        _build_db(
+            db,
+            hours=[
+                _hour("EURUSD", "2026-01-01T10:00:00", file_path=r"C:\data\EURUSD\2026\01\01\10.bin"),
+                _hour("eurusd", "2026-01-01T10:00:00", file_path=r"C:\data\EURUSD\2026\01\01\10.bin"),
+                _hour("eurusd", "2026-01-01T11:00:00", status="empty", tick_count=0, file_path=None),
+            ],
+        )
+
+        deleted = normalize_instrument_case(db)
+        self.assertEqual(deleted, 2)
+
+        conn = sqlite3.connect(str(db))
+        try:
+            rows = conn.execute(
+                "SELECT instrument, hour_utc, status, tick_count, file_path "
+                "FROM hour_status ORDER BY hour_utc"
+            ).fetchall()
+            self.assertEqual([r[0] for r in rows], ["EURUSD", "EURUSD"])
+            self.assertTrue(all(r[0] == r[0].upper() for r in rows))
+            # Both the file hour and the empty hour survive under uppercase.
+            keys = {r[1] for r in rows}
+            self.assertEqual(keys, {"2026-01-01T10:00:00", "2026-01-01T11:00:00"})
+        finally:
+            conn.close()
+
+    def test_already_uppercase_is_noop(self):
+        db = self._dir / "ledger.db"
+        _build_db(db, hours=[_hour("EURUSD", "2026-01-01T10:00:00")])
+        self.assertEqual(normalize_instrument_case(db), 0)
 
 
 class RebuildMetadataLedgerTests(unittest.TestCase):
