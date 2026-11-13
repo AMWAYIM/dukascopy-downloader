@@ -49,6 +49,7 @@ _active_terminal: dict[str, Path] = {}
 IMPORT_TIMEOUT_SEC = 6 * 3600
 MT5_STARTUP_TIMEOUT_SEC = 120
 MT5_PS_TIMEOUT_SEC = 10
+MT5_PS_WMI_TIMEOUT_SEC = 5
 # MT5 can intermittently fail to open a file after a very large Common\Files
 # job folder.  Keep each script run below that practical limit and append the
 # batches into the same custom symbol.
@@ -1001,13 +1002,47 @@ def is_mt5_running(terminal_exe: Path) -> bool:
         "Where-Object { $_.Path -and ($_.Path -ieq $target) }; "
         "if ($p) { exit 0 } else { exit 1 }"
     )
-    result = subprocess.run(
-        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-        capture_output=True,
-        timeout=MT5_PS_TIMEOUT_SEC,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            timeout=MT5_PS_TIMEOUT_SEC,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        logging.getLogger(__name__).warning(
+            "MT5 running probe timed out after %ss — checking via WMI",
+            MT5_PS_TIMEOUT_SEC,
+        )
+        return _terminal_running_via_wmi(terminal_exe)
     return result.returncode == 0
+
+
+def _terminal_running_via_wmi(terminal_exe: Path) -> bool:
+    """Fallback running check via WMI; assumes running if the probe cannot answer."""
+    if os.name != "nt":
+        return True
+    resolved = str(terminal_exe.resolve()).replace("'", "''")
+    process_name = terminal_exe.stem.replace("'", "''")
+    script = (
+        f"Get-CimInstance Win32_Process -Filter \"Name='{process_name}.exe'\" | "
+        "ForEach-Object { $_.ExecutablePath }"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=MT5_PS_WMI_TIMEOUT_SEC,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True
+    target = resolved.casefold()
+    for line in (result.stdout or "").splitlines():
+        if line.strip().casefold() == target:
+            return True
+    return False
 
 
 def wait_mt5_exit(terminal_exe: Path, timeout_sec: float = 30.0) -> None:
