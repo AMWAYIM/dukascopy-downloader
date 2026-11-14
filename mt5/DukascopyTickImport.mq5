@@ -4,7 +4,7 @@
 //| Launched via [StartUp] Script= in import.ini (live terminal).     |
 //+------------------------------------------------------------------+
 #property copyright "Dukascopy Downloader"
-#property version   "1.23"
+#property version   "1.24"
 #property strict
 #property script_show_inputs
 
@@ -177,7 +177,7 @@ bool WriteProgressThrottled(const string state, const string phase, const long t
                    + "message=" + message + "\n"
                    + "error_code=" + IntegerToString(errorCode) + "\n"
                    + filesLine
-                   + "script_version=1.23\n";
+                   + "script_version=1.24\n";
    for(int attempt = 0; attempt < 20; attempt++)
      {
       // Quiet while terminal retries are pending: a persistently locked
@@ -598,25 +598,6 @@ bool ImportTicksFromHourFiles(const string customSymbol, const string hoursPath,
    return true;
   }
 
-//+------------------------------------------------------------------+
-long CountSymbolTicks(const string symbol)
-  {
-   MqlTick ticks[];
-   long total = 0;
-   ulong fromMsc = 1;
-   const uint batch = 1000000;
-   while(true)
-     {
-      int n = CopyTicks(symbol, ticks, COPY_TICKS_ALL, fromMsc, batch);
-      if(n <= 0)
-         break;
-      total += n;
-      fromMsc = (ulong)ticks[n - 1].time_msc + 1;
-      if((uint)n < batch)
-         break;
-     }
-   return total;
-  }
 
 //+------------------------------------------------------------------+
 bool ApplySymbolProperties(const string customSymbol, const int digits)
@@ -641,32 +622,6 @@ bool EndsWith(const string text, const string suffix)
    return StringSubstr(text, textLen - suffixLen) == suffix;
   }
 
-//+------------------------------------------------------------------+
-bool GetSymbolTickSpan(const string symbol, long &firstMsc, long &lastMsc)
-  {
-   MqlTick firstTick[];
-   int nFirst = CopyTicks(symbol, firstTick, COPY_TICKS_ALL, 1, 1);
-   if(nFirst <= 0)
-      return false;
-   firstMsc = firstTick[0].time_msc;
-
-   MqlTick probe[];
-   ulong fromMsc = (ulong)firstMsc;
-   long last = firstMsc;
-   const uint batch = 1000000;
-   while(true)
-     {
-      int n = CopyTicks(symbol, probe, COPY_TICKS_ALL, fromMsc, batch);
-      if(n <= 0)
-         break;
-      last = probe[n - 1].time_msc;
-      fromMsc = (ulong)last + 1;
-      if((uint)n < batch)
-         break;
-     }
-   lastMsc = last;
-   return true;
-  }
 
 //+------------------------------------------------------------------+
 bool MatchesFilter(const string symbol, const string customPath, const string suffix)
@@ -709,23 +664,41 @@ bool ListCustomSymbols(const string customPath, const string suffix)
       return false;
      }
 
+   const ulong deadlineMs = GetTickCount64() + 540000;
+
    int total = SymbolsTotal(false);
    int listed = 0;
    for(int i = 0; i < total; i++)
      {
+      if(GetTickCount64() >= deadlineMs)
+        {
+         WriteProgress("error", "list", 0, 0, 0, "",
+                       "Listing timed out after " + IntegerToString(listed) + " custom symbol(s)", 0);
+         if(outC != INVALID_HANDLE)
+            FileClose(outC);
+         if(outL != INVALID_HANDLE)
+            FileClose(outL);
+         return false;
+        }
+
       string sym = SymbolName(i, false);
       if(!MatchesFilter(sym, customPath, suffix))
          continue;
 
-      long ticks = CountSymbolTicks(sym);
+      // O(1) span: earliest tick from time=1, latest tick from from=0. Exact
+      // tick counts are merged by the Python controller from its import cache.
+      MqlTick probe[];
       long firstMsc = 0;
       long lastMsc = 0;
-      if(ticks > 0)
-         GetSymbolTickSpan(sym, firstMsc, lastMsc);
+      if(CopyTicks(sym, probe, COPY_TICKS_ALL, 1, 1) > 0)
+        {
+         firstMsc = probe[0].time_msc;
+         if(CopyTicks(sym, probe, COPY_TICKS_ALL, 0, 1) > 0)
+            lastMsc = probe[0].time_msc;
+        }
 
       string symPath = SymbolInfoString(sym, SYMBOL_PATH);
-      string outLine = sym + "|" + IntegerToString(ticks)
-                      + "|" + IntegerToString(firstMsc)
+      string outLine = sym + "|0|" + IntegerToString(firstMsc)
                       + "|" + IntegerToString(lastMsc)
                       + "|" + symPath + "\n";
       if(outC != INVALID_HANDLE)
@@ -733,6 +706,10 @@ bool ListCustomSymbols(const string customPath, const string suffix)
       if(outL != INVALID_HANDLE)
          FileWriteString(outL, outLine);
       listed++;
+
+      int pct = total > 0 ? (int)((listed * 100L) / total) : 100;
+      WriteProgress("running", "list", 0, 0, pct, "",
+                    "Listing custom symbols... " + IntegerToString(listed) + " / " + IntegerToString(total));
      }
 
    if(outC != INVALID_HANDLE)
