@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import os
 import shutil
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -32,6 +35,92 @@ from export.mt5_importer import (
 )
 
 logger = logging.getLogger(__name__)
+
+SYMBOL_STATS_FILE = "mt5_custom_symbol_stats.json"
+_STATS_LOCK = threading.Lock()
+
+
+def symbol_stats_path(data_dir: Path) -> Path:
+    return Path(data_dir) / SYMBOL_STATS_FILE
+
+
+def load_symbol_stats(data_dir: Path) -> dict[str, dict[str, int]]:
+    """Return the cached stats map {symbol: {ticks, first_ms, last_ms}}."""
+    path = symbol_stats_path(data_dir)
+    try:
+        if not path.is_file():
+            return {}
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, dict[str, int]] = {}
+        for sym, info in raw.items():
+            if not isinstance(sym, str) or not isinstance(info, dict):
+                continue
+            try:
+                out[sym] = {
+                    "ticks": int(info.get("ticks", 0)),
+                    "first_ms": int(info.get("first_ms", 0)),
+                    "last_ms": int(info.get("last_ms", 0)),
+                }
+            except (TypeError, ValueError):
+                continue
+        return out
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _write_symbol_stats(data_dir: Path, stats: dict[str, dict[str, int]]) -> None:
+    path = symbol_stats_path(data_dir)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(
+        json.dumps(stats, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    os.replace(tmp, path)
+
+
+def save_symbol_stats(
+    data_dir: Path,
+    symbol: str,
+    ticks: int,
+    first_ms: int,
+    last_ms: int,
+    *,
+    append: bool = True,
+) -> dict[str, int]:
+    """Merge one completed import's stats into the cache for ``symbol``.
+
+    ``append=True`` (default) accumulates ticks onto the cached count (an
+    import that appends to existing history); ``append=False`` replaces the
+    cached count (e.g. a full overwrite/replace import). First/last are always
+    widened to the union of cached and new values. Returns the merged entry.
+    """
+    ticks = max(0, int(ticks))
+    first_ms = int(first_ms)
+    last_ms = int(last_ms)
+    with _STATS_LOCK:
+        stats = load_symbol_stats(data_dir)
+        prev = stats.get(symbol, {})
+        prev_ticks = int(prev.get("ticks", 0))
+        prev_first = int(prev.get("first_ms", 0))
+        prev_last = int(prev.get("last_ms", 0))
+
+        merged_ticks = (prev_ticks + ticks) if append else ticks
+        merged_first = prev_first if prev_first and (not first_ms or prev_first <= first_ms) else first_ms
+        merged_last = prev_last if prev_last > last_ms else last_ms
+        entry = {"ticks": merged_ticks, "first_ms": merged_first, "last_ms": merged_last}
+        stats[symbol] = entry
+        _write_symbol_stats(data_dir, stats)
+    return entry
+
+
+def prune_symbol_stats(data_dir: Path, symbol: str) -> None:
+    with _STATS_LOCK:
+        stats = load_symbol_stats(data_dir)
+        if stats.pop(symbol, None) is not None:
+            _write_symbol_stats(data_dir, stats)
+
 
 MANAGER_TIMEOUT_SEC = 10 * 60
 
@@ -176,6 +265,14 @@ def _wait_for_manager(progress_path: Path, job_dir: Path, mt5: Mt5Settings) -> d
     )
 
 
+def _merge_cached_ticks(symbols: list[CustomSymbolInfo], stats: dict[str, dict[str, int]]) -> None:
+    """Fill exact tick counts from the import cache (rows carry a 0 placeholder)."""
+    for s in symbols:
+        cached = stats.get(s.symbol)
+        if cached and int(cached.get("ticks", 0)) > 0:
+            s.ticks = int(cached["ticks"])
+
+
 def _run_symbol_job(
     mt5_raw: dict[str, Any],
     settings_data_dir: Path,
@@ -258,12 +355,17 @@ def list_custom_symbols(mt5_raw: dict[str, Any], settings_data_dir: Path) -> lis
         for job_dir in job_dirs:
             symbols_file = job_dir / "symbols.txt"
             if symbols_file.is_file():
-                parsed = [s.to_dict() for s in _parse_symbols_file(symbols_file)]
+                parsed = _parse_symbols_file(symbols_file)
+                # The MT5 script emits live first/last spans with a zero count
+                # placeholder; fill exact tick counts from the import cache.
+                stats = load_symbol_stats(settings_data_dir)
+                _merge_cached_ticks(parsed, stats)
+                serialized = [s.to_dict() for s in parsed]
                 logger.info(
                     "MT5 list: %d symbol(s) suffix=%s custom_path=dukascopy: %s",
-                    len(parsed), suffix, [s["symbol"] for s in parsed],
+                    len(serialized), suffix, [s["symbol"] for s in serialized],
                 )
-                return parsed
+                return serialized
         if not job_dirs:
             raise Mt5JobError("MT5 list job produced no symbols.txt (no job folder available)")
         raise Mt5JobError(
@@ -293,6 +395,10 @@ def delete_custom_symbol(
     try:
         _run_symbol_job(mt5_raw, settings_data_dir, manifest, chart_symbol="EURUSD")
         ok = True
+        try:
+            prune_symbol_stats(settings_data_dir, symbol)
+        except Exception:
+            logger.exception("failed to prune symbol stats for %s", symbol)
     except Mt5JobError as exc:
         log_path = _append_persistent_log(settings_data_dir, str(exc))
         logger.error(

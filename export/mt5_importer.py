@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import shutil
+import struct
 import subprocess
 import tempfile
 import threading
@@ -42,7 +43,7 @@ LEGACY_MANAGER_NAMES = (
     "DukascopySymbolManager.ex5",
 )
 JOB_ROOT = "dukascopy_jobs"
-EXPECTED_SCRIPT_VERSION = "1.23"
+EXPECTED_SCRIPT_VERSION = "1.24"
 
 _import_lock = threading.Lock()
 _active_terminal: dict[str, Path] = {}
@@ -1422,6 +1423,40 @@ def _import_ticks_locked(
             shutil.rmtree(staging_dir, ignore_errors=True)
 
 
+def _hour_file_first_last_ms(path: Path) -> tuple[int, int] | None:
+    """Return (first_ms, last_ms) of a bin_v1 hour file, or None."""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(4)
+            if len(header) != 4:
+                return None
+            count = struct.unpack("<I", header)[0]
+            if count == 0:
+                return None
+            first_ms = struct.unpack("<q", f.read(8))[0]
+            f.seek(4 + 8 * count + 16 * (count - 1))
+            last_ms = struct.unpack("<q", f.read(8))[0]
+            return first_ms, last_ms
+    except (OSError, struct.error):
+        return None
+
+
+def _sources_span(sources: list[Path]) -> tuple[int, int]:
+    """Union (first_ms, last_ms) over staged source hour files."""
+    first = 0
+    last = 0
+    for path in sources:
+        pair = _hour_file_first_last_ms(path)
+        if pair is None:
+            continue
+        f, l = pair
+        if first == 0 or f < first:
+            first = f
+        if l > last:
+            last = l
+    return first, last
+
+
 def prepare_and_import(
     settings: Settings,
     store: TickStorage,
@@ -1494,6 +1529,7 @@ def prepare_and_import(
         sources, ticks_source = publisher.resolve_sources(instrument, span_start, span_end)
         if not sources:
             raise FileNotFoundError("No hour tick files found for import range")
+        span_first_ms, span_last_ms = _sources_span(sources)
 
         batch_count = (len(sources) + MAX_HOUR_FILES_PER_IMPORT - 1) // MAX_HOUR_FILES_PER_IMPORT
         imported_total = 0
@@ -1577,6 +1613,20 @@ def prepare_and_import(
             )
             imported_total += int(import_result.get("ticks_imported", 0))
             files_total += result.hours_with_data
+
+            try:
+                # Deferred import: mt5_symbol_manager imports from this module.
+                from export.mt5_symbol_manager import save_symbol_stats
+                save_symbol_stats(
+                    settings.data_dir,
+                    custom_name,
+                    int(import_result.get("ticks_imported", 0)),
+                    span_first_ms,
+                    span_last_ms,
+                    append=(manifest.get("replace_existing") != "1"),
+                )
+            except Exception:
+                logger.exception("failed to persist MT5 custom symbol stats for %s", custom_name)
 
         return {
             "custom_symbol": custom_name,
