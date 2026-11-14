@@ -91,10 +91,11 @@ def save_symbol_stats(
 ) -> dict[str, int]:
     """Merge one completed import's stats into the cache for ``symbol``.
 
-    ``append=True`` (default) accumulates ticks onto the cached count (an
-    import that appends to existing history); ``append=False`` replaces the
-    cached count (e.g. a full overwrite/replace import). First/last are always
-    widened to the union of cached and new values. Returns the merged entry.
+    ``append=True`` (default) accumulates ticks onto the cached count and
+    widens the span to the union (an import that appends to existing history).
+    ``append=False`` replaces the cached count and span (e.g. a full
+    overwrite/replace import that clears prior history). Returns the merged
+    entry.
     """
     ticks = max(0, int(ticks))
     first_ms = int(first_ms)
@@ -107,8 +108,12 @@ def save_symbol_stats(
         prev_last = int(prev.get("last_ms", 0))
 
         merged_ticks = (prev_ticks + ticks) if append else ticks
-        merged_first = prev_first if prev_first and (not first_ms or prev_first <= first_ms) else first_ms
-        merged_last = prev_last if prev_last > last_ms else last_ms
+        if append:
+            merged_first = prev_first if prev_first and (not first_ms or prev_first <= first_ms) else first_ms
+            merged_last = prev_last if prev_last > last_ms else last_ms
+        else:
+            merged_first = first_ms if first_ms else prev_first
+            merged_last = last_ms if last_ms else prev_last
         entry = {"ticks": merged_ticks, "first_ms": merged_first, "last_ms": merged_last}
         stats[symbol] = entry
         _write_symbol_stats(data_dir, stats)

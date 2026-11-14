@@ -1434,7 +1434,7 @@ def _hour_file_first_last_ms(path: Path) -> tuple[int, int] | None:
             if count == 0:
                 return None
             first_ms = struct.unpack("<q", f.read(8))[0]
-            f.seek(4 + 8 * count + 16 * (count - 1))
+            f.seek(4 + 8 * (count - 1))
             last_ms = struct.unpack("<q", f.read(8))[0]
             return first_ms, last_ms
     except (OSError, struct.error):
